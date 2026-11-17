@@ -1,0 +1,34 @@
+name: daily-fetch
+# 毎日 10:30 JST：前日分の確定データ（結果・払戻・確定オッズ・天気）と、当日分の出走表・並び予想・朝のオッズを取る（Gemini作成、Claude修正）
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+concurrency: { group: keirin-daily, cancel-in-progress: false }
+permissions: { contents: read }
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env: { PYTHONPATH: "${{ github.workspace }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { rclone_config: "${{ secrets.RCLONE_CONFIG }}" }
+      - name: 対象日（JST）
+        id: d
+        run: |
+          Y=$(TZ=Asia/Tokyo date -d yesterday +%Y-%m-%d); T=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          echo "y=$Y" >> "$GITHUB_OUTPUT"; echo "t=$T" >> "$GITHUB_OUTPUT"
+          echo "inc1=*/${Y:0:4}/${Y:0:7}.parquet" >> "$GITHUB_OUTPUT"; echo "inc2=*/${T:0:4}/${T:0:7}.parquet" >> "$GITHUB_OUTPUT"
+          echo "dn1=_done/${Y:0:4}/${Y:0:7}.txt" >> "$GITHUB_OUTPUT"; echo "dn2=_done/${T:0:4}/${T:0:7}.txt" >> "$GITHUB_OUTPUT"
+      - name: その月のデータをDriveから取得
+        run: rclone copy gdrive:keirin-predictor/data data --include "${{ steps.d.outputs.inc1 }}" --include "${{ steps.d.outputs.inc2 }}" --include "${{ steps.d.outputs.dn1 }}" --include "${{ steps.d.outputs.dn2 }}" || true
+      - name: 前日分（確定）
+        run: python -m keirin.scripts.collect --start "${{ steps.d.outputs.y }}" --end "${{ steps.d.outputs.y }}" --max-minutes 80
+      - name: 当日分（出走表・並び予想・朝のオッズ）
+        if: always()
+        run: python -m keirin.scripts.collect --start "${{ steps.d.outputs.t }}" --end "${{ steps.d.outputs.t }}" --today-mode --max-minutes 50
+      - name: Driveへ保存
+        if: always()
+        run: '[ -d data ] && rclone copy data gdrive:keirin-predictor/data || true'

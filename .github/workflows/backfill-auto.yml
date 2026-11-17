@@ -1,0 +1,54 @@
+name: backfill-auto
+# 過去データの自動取得（Gemini作成、Claude修正）。
+# config/backfill_range.txt（"開始,終了"）の期間を、まだ「月完了」の印がない最初の月から取る。
+# 1回の実行（約5時間半）で1か月の半分ほど進むので、6時間ごとに続きから取る。
+on:
+  schedule:
+    - cron: "15 */6 * * *"
+  workflow_dispatch:
+concurrency: { group: keirin-fetch, cancel-in-progress: false }
+permissions: { contents: read }
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env: { PYTHONPATH: "${{ github.workspace }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { rclone_config: "${{ secrets.RCLONE_CONFIG }}" }
+      - name: 取得済みの記録をDriveから取得
+        run: rclone copy gdrive:keirin-predictor/data data --include "_done/**" || true
+      - name: まだ終わっていない最初の月を決める
+        id: month
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import datetime, pathlib
+          s, e = open("config/backfill_range.txt").read().strip().split(",")
+          s, e = datetime.date.fromisoformat(s), datetime.date.fromisoformat(e)
+          cur = s.replace(day=1)
+          while cur <= e:
+              f = pathlib.Path(f"data/_done/{cur:%Y}/{cur:%Y-%m}.txt")
+              if not (f.exists() and f"*|{cur:%Y-%m}-01|month_complete" in f.read_text()):
+                  nxt = (cur.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+                  print(f"start={max(s, cur)}")
+                  print(f"end={min(e, nxt - datetime.timedelta(days=1))}")
+                  print(f"ym={cur:%Y-%m}")
+                  print(f"y={cur:%Y}")
+                  break
+              cur = (cur.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+          else:
+              print("done=1")
+          PY
+      - name: 全期間取得済み
+        if: steps.month.outputs.done == '1'
+        run: echo "config/backfill_range.txt の期間はすべて取得済みです。期間を書き換えるか、このワークフローを無効にしてください。"
+      - name: その月のParquetをDriveから取得
+        if: steps.month.outputs.done != '1'
+        run: rclone copy gdrive:keirin-predictor/data data --include "*/${{ steps.month.outputs.y }}/${{ steps.month.outputs.ym }}.parquet" || true
+      - name: 取得
+        if: steps.month.outputs.done != '1'
+        run: python -m keirin.scripts.collect --start "${{ steps.month.outputs.start }}" --end "${{ steps.month.outputs.end }}" --max-minutes 320
+      - name: Driveへ保存
+        if: always() && steps.month.outputs.done != '1'
+        run: '[ -d data ] && rclone copy data gdrive:keirin-predictor/data || true'

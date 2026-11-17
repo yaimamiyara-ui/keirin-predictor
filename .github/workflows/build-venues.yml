@@ -1,0 +1,38 @@
+name: build-venues
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Run build_venues script
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m keirin.scripts.build_venues
+
+      - name: Commit and push venues.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add config/venues.json
+          if git diff --staged --quiet; then
+            echo "No changes in venues.json"
+          else
+            git commit -m "Update config/venues.json"
+            git push
+          fi
