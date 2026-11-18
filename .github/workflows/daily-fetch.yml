@@ -3,6 +3,9 @@ name: daily-fetch
 on:
   schedule:
     - cron: "30 1 * * *"
+    # 定時実行が抜けたときの予備（取得済みの分は飛ばすので重複しない）
+    - cron: "40 3 * * *"
+    - cron: "50 6 * * *"
   workflow_dispatch:
 concurrency: { group: keirin-daily, cancel-in-progress: false }
 permissions: { contents: read }

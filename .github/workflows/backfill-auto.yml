@@ -7,7 +7,7 @@ on:
     - cron: "15 */6 * * *"
   workflow_dispatch:
 concurrency: { group: keirin-fetch, cancel-in-progress: false }
-permissions: { contents: read }
+permissions: { contents: read, actions: write }
 jobs:
   backfill:
     runs-on: ubuntu-latest
@@ -52,3 +52,7 @@ jobs:
       - name: Driveへ保存
         if: always() && steps.month.outputs.done != '1'
         run: '[ -d data ] && rclone copy data gdrive:keirin-predictor/data || true'
+      - name: 続きがあれば自分をもう一度起動（GitHubの定時実行が抜けることがあるため）
+        if: success() && steps.month.outputs.done != '1'
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh workflow run backfill-auto.yml --ref main
