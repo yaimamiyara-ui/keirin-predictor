@@ -259,7 +259,6 @@ def main() -> None:
 
                         except Exception as e:
                             logger.warning(f"Netkeirin failed in today-mode for {vel_code} {open_day} R{r_num}: {e}")
-                            check_error_threshold()
 
                 storage.save("race", open_day, r_rows)
                 storage.save("entry", open_day, e_rows)
@@ -374,8 +373,10 @@ def main() -> None:
 
                 storage.add_done(vel_code, open_day, "netkeirin")
             except Exception as e:
+                # netkeirin は補助の取得元。一時的に失敗しても主力（チャリロト）を止めない。
+                # 取得済みにしないので次の実行でやり直す（Claude修正、2026-11-20）
                 logger.error(f"Netkeirin failed for {vel_code} {open_day}: {e}")
-                check_error_threshold()
+                any_failure = True
 
         # 3. Weather
         if "weather" in sources and not storage.is_done(vel_code, open_day, "weather"):
