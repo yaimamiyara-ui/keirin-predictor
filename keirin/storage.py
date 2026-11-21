@@ -81,8 +81,8 @@ class ParquetStorage:
     new_done_count = 0
 
     def add_done(self, vel_code: str, open_day: str, kind: str) -> None:
-        if kind != "month_complete":
-            type(self).new_done_count += 1
+        # 月完了の印も「進んだ」に数える（次の月へ続けて進むため）
+        type(self).new_done_count += 1
         done_path = self._get_done_path(open_day)
         done_path.parent.mkdir(parents=True, exist_ok=True)
 
