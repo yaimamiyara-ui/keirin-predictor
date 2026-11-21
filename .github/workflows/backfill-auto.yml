@@ -55,4 +55,8 @@ jobs:
       - name: 続きがあれば自分をもう一度起動（GitHubの定時実行が抜けることがあるため）
         if: success() && steps.month.outputs.done != '1'
         env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh workflow run backfill-auto.yml --ref main
+        # この実行で何も新しく取れなかったときは再起動しない（空回り防止。次の定時実行に任せる）
+        run: |
+          n=$(cat collect_progress.txt 2>/dev/null || echo 0)
+          echo "この実行で新しく取得: $n"
+          if [ "$n" -gt 0 ]; then gh workflow run backfill-auto.yml --ref main; else echo "新しい取得がないので再起動しません"; fi

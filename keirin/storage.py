@@ -77,7 +77,12 @@ class ParquetStorage:
                     return True
         return False
 
+    # この実行で新しく取得済みにした数（空回り防止に使う。Claude追加）
+    new_done_count = 0
+
     def add_done(self, vel_code: str, open_day: str, kind: str) -> None:
+        if kind != "month_complete":
+            type(self).new_done_count += 1
         done_path = self._get_done_path(open_day)
         done_path.parent.mkdir(parents=True, exist_ok=True)
 

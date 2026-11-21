@@ -129,8 +129,10 @@ def main() -> None:
                     if not target_venues or v_code in target_venues:
                         calendar_active_venues.add(v_code)
         except Exception as e:
-            logger.warning(f"Failed to fetch calendar for {yr}-{mo:02d}: {e}")
-            check_error_threshold()
+            # 過去の月はカレンダーのページが無い（404）ことがある。カレンダーは場の絞り込みにしか使わないので、
+            # 失敗扱いにせず全場を対象にする（開催日は場ごとの開催日一覧で確定する）。Claude修正 2026-11-21
+            logger.warning(f"Calendar not available for {yr}-{mo:02d} ({e}); using all venues")
+            calendar_active_venues |= set(target_venues or [])
 
     if not calendar_active_venues and target_venues:
         calendar_active_venues = target_venues
@@ -437,6 +439,12 @@ def main() -> None:
             if args.start <= month_start and args.end >= (datetime.strptime(next_month, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"):
                 storage.add_done("*", month_start, "month_complete")
 
+    # この実行で新しく取れた数をファイルに残す（0なら backfill-auto は自分を再起動しない＝空回り防止）
+    try:
+        pathlib.Path("collect_progress.txt").write_text(str(ParquetStorage.new_done_count))
+    except Exception:
+        pass
+    logger.info(f"New done entries this run: {ParquetStorage.new_done_count}")
     logger.info("=== Final Request Summary ===")
     logger.info(f"Chariloto Total Requests: {chari_client.request_count}")
     logger.info(f"Polite Total Requests: {polite_client.request_count}")

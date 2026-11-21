@@ -58,7 +58,7 @@ def test_collect_script_normal_and_partial_failure(tmp_path: pathlib.Path, monke
             "is_indoor": False,
             "lat": 41.791,
             "lon": 140.768,
-            "jma_station": {"kind": "a", "block_no": "1234", "prec_no": 11}
+            "jma": {"kind": "a", "block_no": "1234", "prec_no": 11}
         }
     }
     with open(venues_dir / "venues.json", "w", encoding="utf-8") as f:
