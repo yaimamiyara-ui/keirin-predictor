@@ -4,7 +4,7 @@ import logging
 import pathlib
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from keirin.fetch.chariloto import (
@@ -74,6 +74,62 @@ def _is_confirmed_no_races(meeting: Dict[str, Any], races_menu: List[Dict[str, A
         if val and any(kw in str(val) for kw in cancel_keywords):
             return True
     return False
+
+
+def _is_race_cancelled(race_item: Dict[str, Any]) -> bool:
+    if not isinstance(race_item, dict):
+        return False
+    cancel_keywords = ("中止", "順延", "開催なし", "不成立")
+    for field in ("event_name", "status", "rehold_string", "cancel_reason", "note"):
+        val = race_item.get(field)
+        if val and any(kw in str(val) for kw in cancel_keywords):
+            return True
+    return False
+
+
+def select_backfill_month(
+    range_file: pathlib.Path = pathlib.Path("config/backfill_range.txt"),
+    done_dir: pathlib.Path = pathlib.Path("data/_done"),
+    jst_today: Optional[date] = None,
+) -> Dict[str, str]:
+    s_str, e_str = range_file.read_text(encoding="utf-8").strip().split(",")
+    s, e = date.fromisoformat(s_str.strip()), date.fromisoformat(e_str.strip())
+    if jst_today is None:
+        jst_today = (datetime.utcnow() + timedelta(hours=9)).date()
+    daily_from = (jst_today - timedelta(days=1)).replace(day=1)
+
+    cur = s.replace(day=1)
+    while cur <= e and cur < daily_from:
+        f = done_dir / f"{cur:%Y}" / f"{cur:%Y-%m}.txt"
+        if not (f.exists() and f"*|{cur:%Y-%m}-01|month_complete" in f.read_text(encoding="utf-8")):
+            nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+            return {
+                "status": "selected",
+                "start": str(max(s, cur)),
+                "end": str(min(e, nxt - timedelta(days=1))),
+                "ym": f"{cur:%Y-%m}",
+                "y": f"{cur:%Y}",
+                "done_inc": f"_done/{cur:%Y}/{cur:%Y-%m}*.txt",
+                "parquet_inc": f"*/{cur:%Y}/{cur:%Y-%m}.parquet",
+            }
+        cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+    while cur <= e:
+        f = done_dir / f"{cur:%Y}" / f"{cur:%Y-%m}.txt"
+        if not (f.exists() and f"*|{cur:%Y-%m}-01|month_complete" in f.read_text(encoding="utf-8")):
+            return {
+                "status": "deferred",
+                "done": "1",
+                "deferred": "1",
+                "ym": f"{cur:%Y-%m}",
+            }
+        cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+    return {
+        "status": "complete",
+        "done": "1",
+        "deferred": "0",
+    }
 
 
 def main() -> None:
@@ -347,58 +403,81 @@ def main() -> None:
                         logger.info(f"Confirmed no races for Chariloto {vel_code} {open_day}")
                         storage.add_done(vel_code, open_day, "chariloto")
                     else:
+                        menu_races = [r for r in races_menu if r.get("race_num")]
+                        if not menu_races:
+                            raise ValueError(f"Empty vel_menu races for Chariloto on scheduled day {vel_code} {open_day}")
+
+                        expected_r_nums = sorted(list(set(
+                            r["race_num"] for r in menu_races if not _is_race_cancelled(r)
+                        )))
                         r_num_set = set(r["race_num"] for r in res_list if r.get("race_num"))
-                        if not res_list or not r_num_set:
-                            raise ValueError(f"Empty Chariloto results for scheduled day {vel_code} {open_day}")
 
-                        r_rows, e_rows, p_rows, o_rows = [], [], [], []
+                        if not expected_r_nums and not res_list:
+                            logger.info(f"All menu races cancelled for Chariloto {vel_code} {open_day}")
+                            storage.add_done(vel_code, open_day, "chariloto")
+                        else:
+                            if not res_list or not r_num_set:
+                                raise ValueError(f"Empty Chariloto results for scheduled day {vel_code} {open_day}")
 
-                        for r_num in sorted(list(r_num_set)):
-                            if time.monotonic() >= deadline:
-                                logger.info("Reached max execution time limit inside Chariloto race loop. Stopping safely.")
-                                timed_out = True
+                            missing_results = [rn for rn in expected_r_nums if rn not in r_num_set]
+                            if missing_results:
+                                raise ValueError(
+                                    f"Incomplete Chariloto results for {vel_code} {open_day}: missing races {missing_results}"
+                                )
+
+                            r_rows, e_rows, p_rows, o_rows = [], [], [], []
+                            races_to_fetch = sorted(list(set(expected_r_nums) | r_num_set))
+
+                            for r_num in races_to_fetch:
+                                if time.monotonic() >= deadline:
+                                    logger.info("Reached max execution time limit inside Chariloto race loop. Stopping safely.")
+                                    timed_out = True
+                                    break
+
+                                r_info, entries, pred = fetch_race_info(chari_client, open_day, vel_code, r_num)
+                                if not r_info or (r_num in expected_r_nums and not entries):
+                                    raise ValueError(
+                                        f"Empty Chariloto race/entry rows for {vel_code} {open_day} R{r_num}"
+                                    )
+                                r_info.update(meeting)
+                                r_rows.append(r_info)
+
+                                for e in entries:
+                                    e["open_day"] = open_day
+                                    e["vel_code"] = vel_code
+                                    e["race_num"] = r_num
+                                    e_rows.append(e)
+
+                                pred["open_day"] = open_day
+                                pred["vel_code"] = vel_code
+                                pred["race_num"] = r_num
+                                p_rows.append(pred)
+
+                                odds_data = fetch_odds(chari_client, open_day, vel_code, r_num, snapshot_label=args.snapshot)
+                                for od in odds_data:
+                                    od["open_day"] = open_day
+                                    od["vel_code"] = vel_code
+                                    od["race_num"] = r_num
+                                    o_rows.append(od)
+
+                            if timed_out:
                                 break
 
-                            r_info, entries, pred = fetch_race_info(chari_client, open_day, vel_code, r_num)
-                            r_info.update(meeting)
-                            r_rows.append(r_info)
+                            if not r_rows or not e_rows:
+                                raise ValueError(f"Empty Chariloto race/entry rows for scheduled day {vel_code} {open_day}")
 
-                            for e in entries:
-                                e["open_day"] = open_day
-                                e["vel_code"] = vel_code
-                                e["race_num"] = r_num
-                                e_rows.append(e)
+                            for l in lineup_list:
+                                l["source"] = "chariloto"
 
-                            pred["open_day"] = open_day
-                            pred["vel_code"] = vel_code
-                            pred["race_num"] = r_num
-                            p_rows.append(pred)
+                            storage.save("race", open_day, r_rows)
+                            storage.save("entry", open_day, e_rows)
+                            storage.save("prediction", open_day, p_rows)
+                            storage.save("odds", open_day, o_rows)
+                            storage.save("result", open_day, res_list)
+                            storage.save("payout", open_day, payout_list)
+                            storage.save("lineup", open_day, lineup_list)
 
-                            odds_data = fetch_odds(chari_client, open_day, vel_code, r_num, snapshot_label=args.snapshot)
-                            for od in odds_data:
-                                od["open_day"] = open_day
-                                od["vel_code"] = vel_code
-                                od["race_num"] = r_num
-                                o_rows.append(od)
-
-                        if timed_out:
-                            break
-
-                        if not r_rows or not e_rows:
-                            raise ValueError(f"Empty Chariloto race/entry rows for scheduled day {vel_code} {open_day}")
-
-                        for l in lineup_list:
-                            l["source"] = "chariloto"
-
-                        storage.save("race", open_day, r_rows)
-                        storage.save("entry", open_day, e_rows)
-                        storage.save("prediction", open_day, p_rows)
-                        storage.save("odds", open_day, o_rows)
-                        storage.save("result", open_day, res_list)
-                        storage.save("payout", open_day, payout_list)
-                        storage.save("lineup", open_day, lineup_list)
-
-                        storage.add_done(vel_code, open_day, "chariloto")
+                            storage.add_done(vel_code, open_day, "chariloto")
                 except StorageError as e:
                     logger.error(f"Storage error during Chariloto save for {vel_code} {open_day}: {e}")
                     any_failure = True
@@ -421,65 +500,74 @@ def main() -> None:
             else:
                 try:
                     meeting, races_menu = fetch_vel_menu(chari_client, vel_code, open_day)
-                    r_nums = [r["race_num"] for r in races_menu if r.get("race_num")]
+                    menu_races = [r for r in races_menu if r.get("race_num")]
 
                     if _is_confirmed_no_races(meeting, races_menu):
                         logger.info(f"Confirmed no races for Netkeirin {vel_code} {open_day}")
                         storage.add_done(vel_code, open_day, "netkeirin")
                     else:
-                        if not r_nums:
+                        if not menu_races:
                             raise ValueError(f"Empty vel_menu races for Netkeirin on scheduled day {vel_code} {open_day}")
 
-                        nk_e_rows, nk_c_rows, nk_l_rows = [], [], []
-                        for r_num in r_nums:
-                            if time.monotonic() >= deadline:
-                                logger.info("Reached max execution time limit inside Netkeirin race loop. Stopping safely.")
-                                timed_out = True
+                        expected_r_nums = [r["race_num"] for r in menu_races if not _is_race_cancelled(r)]
+                        if not expected_r_nums:
+                            logger.info(f"All menu races cancelled for Netkeirin {vel_code} {open_day}")
+                            storage.add_done(vel_code, open_day, "netkeirin")
+                        else:
+                            nk_e_rows, nk_c_rows, nk_l_rows = [], [], []
+                            for r_num in expected_r_nums:
+                                if time.monotonic() >= deadline:
+                                    logger.info("Reached max execution time limit inside Netkeirin race loop. Stopping safely.")
+                                    timed_out = True
+                                    break
+
+                                race_id = make_race_id(open_day, vel_code, r_num)
+                                nk_entry_data = fetch_nk_entry(polite_client, race_id)
+                                race_entries = nk_entry_data.get("entries") or []
+                                if not race_entries:
+                                    raise ValueError(f"Empty netkeirin entries for {vel_code} {open_day} R{r_num}")
+
+                                honshi = nk_entry_data.get("honshi") or {}
+                                honshi_op = honshi.get("opinion")
+                                honshi_bets = ",".join(honshi.get("bets", [])) if honshi.get("bets") else None
+
+                                for item in race_entries:
+                                    item["open_day"] = open_day
+                                    item["vel_code"] = vel_code
+                                    item["race_num"] = r_num
+                                    item["honshi_opinion"] = honshi_op
+                                    item["honshi_bets"] = honshi_bets
+                                    nk_e_rows.append(item)
+
+                                if nk_entry_data.get("lineup"):
+                                    nk_l_rows.append({
+                                        "open_day": open_day,
+                                        "vel_code": vel_code,
+                                        "race_num": r_num,
+                                        "source": "netkeirin",
+                                        "lineup": nk_entry_data["lineup"]
+                                    })
+
+                                nk_cmts = fetch_nk_comments(polite_client, race_id)
+                                for c in nk_cmts:
+                                    c["open_day"] = open_day
+                                    c["vel_code"] = vel_code
+                                    c["race_num"] = r_num
+                                    nk_c_rows.append(c)
+
+                            if timed_out:
                                 break
 
-                            race_id = make_race_id(open_day, vel_code, r_num)
-                            nk_entry_data = fetch_nk_entry(polite_client, race_id)
-                            honshi = nk_entry_data.get("honshi") or {}
-                            honshi_op = honshi.get("opinion")
-                            honshi_bets = ",".join(honshi.get("bets", [])) if honshi.get("bets") else None
+                            if not nk_e_rows:
+                                raise ValueError(f"Empty netkeirin entries for scheduled day {vel_code} {open_day}")
 
-                            for item in nk_entry_data.get("entries", []):
-                                item["open_day"] = open_day
-                                item["vel_code"] = vel_code
-                                item["race_num"] = r_num
-                                item["honshi_opinion"] = honshi_op
-                                item["honshi_bets"] = honshi_bets
-                                nk_e_rows.append(item)
+                            consecutive_errors = 0
+                            storage.save("nk_entry", open_day, nk_e_rows)
+                            storage.save("nk_comment", open_day, nk_c_rows)
+                            if nk_l_rows:
+                                storage.save("lineup", open_day, nk_l_rows)
 
-                            if nk_entry_data.get("lineup"):
-                                nk_l_rows.append({
-                                    "open_day": open_day,
-                                    "vel_code": vel_code,
-                                    "race_num": r_num,
-                                    "source": "netkeirin",
-                                    "lineup": nk_entry_data["lineup"]
-                                })
-
-                            nk_cmts = fetch_nk_comments(polite_client, race_id)
-                            for c in nk_cmts:
-                                c["open_day"] = open_day
-                                c["vel_code"] = vel_code
-                                c["race_num"] = r_num
-                                nk_c_rows.append(c)
-
-                        if timed_out:
-                            break
-
-                        if not nk_e_rows:
-                            raise ValueError(f"Empty netkeirin entries for scheduled day {vel_code} {open_day}")
-
-                        consecutive_errors = 0
-                        storage.save("nk_entry", open_day, nk_e_rows)
-                        storage.save("nk_comment", open_day, nk_c_rows)
-                        if nk_l_rows:
-                            storage.save("lineup", open_day, nk_l_rows)
-
-                        storage.add_done(vel_code, open_day, "netkeirin")
+                            storage.add_done(vel_code, open_day, "netkeirin")
                 except StorageError as e:
                     logger.error(f"Storage error during Netkeirin save for {vel_code} {open_day}: {e}")
                     any_failure = True
@@ -576,13 +664,26 @@ def main() -> None:
     # 期間内の月を最後まで取り終え、すべての対象場・対象日・対象ソースが完了していれば「月完了」の印を付ける
     if not args.today_mode and not timed_out and not any_failure:
         active_venues = calendar_active_venues or target_venues
+        cfg_range_start: Optional[str] = None
+        cfg_range_end: Optional[str] = None
+        range_path = pathlib.Path("config/backfill_range.txt")
+        if range_path.exists():
+            try:
+                rs, re_ = range_path.read_text(encoding="utf-8").strip().split(",")
+                cfg_range_start, cfg_range_end = rs.strip(), re_.strip()
+            except Exception:
+                pass
+
         for yr, mo in ym_range:
             ym = f"{yr:04d}-{mo:02d}"
             month_start = f"{ym}-01"
             next_month = f"{yr + (mo == 12):04d}-{(mo % 12) + 1:02d}-01"
             month_end = (datetime.strptime(next_month, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-            # 期間がその月を丸ごと含み、かつ対象場の全開催日・全ソースが完了しているときだけ印を付ける
-            if args.start <= month_start and args.end >= month_end and ym not in storage.unreadable_months:
+            eff_start = max(month_start, cfg_range_start) if (cfg_range_start and cfg_range_start.startswith(ym)) else month_start
+            eff_end = min(month_end, cfg_range_end) if (cfg_range_end and cfg_range_end.startswith(ym)) else month_end
+
+            # 期間がその月の対象範囲（端の月は backfill_range 内の日付）をすべて含み、全開催日・全ソースが完了しているときだけ印を付ける
+            if args.start <= eff_start and args.end >= eff_end and ym not in storage.unreadable_months:
                 all_venues_fetched = bool(active_venues) and all(
                     (v, yr) in venue_year_days_cache for v in active_venues
                 )
@@ -590,7 +691,7 @@ def main() -> None:
                     (v, d)
                     for v in sorted(active_venues)
                     for d in venue_year_days_cache.get((v, yr), [])
-                    if d.startswith(ym)
+                    if d.startswith(ym) and eff_start <= d <= eff_end
                 ]
                 if (
                     all_venues_fetched

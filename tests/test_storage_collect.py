@@ -1,3 +1,4 @@
+from datetime import date
 import json
 import pathlib
 import pytest
@@ -7,7 +8,11 @@ from unittest.mock import patch, MagicMock
 from keirin.storage import ParquetStorage, StorageError
 from keirin.fetch.http import PoliteClient, PoliteError, PoliteRateLimitError
 from keirin.fetch.client import ChariClient, ChariError, ChariRateLimitError
+from keirin.fetch.chariloto import parse_results_day, parse_vel_menu, parse_race_info, parse_odds
+from keirin.fetch.netkeirin import parse_nk_entry
 import keirin.scripts.collect as collect_module
+
+SYNTHETIC_FIXTURES_DIR = pathlib.Path(__file__).parent / "fixtures_synthetic"
 
 
 def test_parquet_storage_save_and_done(tmp_path: pathlib.Path):
@@ -335,3 +340,232 @@ def test_http_and_chari_429_retry_after_and_deadline(monkeypatch):
     with pytest.raises(ChariRateLimitError):
         chari.get_html("/api/test2")
     assert chari.session.request.call_count == 1
+
+
+def test_collect_2race_day_partial_chariloto_and_netkeirin(tmp_path: pathlib.Path, monkeypatch):
+    venues_config = {
+        "13": {
+            "vel_code": "13",
+            "name": "テスト場",
+            "is_indoor": True,
+        }
+    }
+
+    res_html = (SYNTHETIC_FIXTURES_DIR / "synthetic_results_day_13_2026-03-10.html").read_text(encoding="utf-8")
+    r1_results, r1_payouts, r1_lineups = parse_results_day(res_html, vel="13", date="2026-03-10")
+
+    race_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_race_info_2026-03-10_13_1.json").read_text(encoding="utf-8"))
+    r1_info, r1_entries, r1_pred = parse_race_info(race_json)
+
+    odds_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_odds_final_2016-01-03_13_1.json").read_text(encoding="utf-8"))
+    r1_odds = parse_odds(odds_json, snapshot_label="final")
+
+    nk_html = (SYNTHETIC_FIXTURES_DIR / "synthetic_nk_entry_ex.html").read_text(encoding="utf-8")
+    nk_parsed = parse_nk_entry(nk_html, "202603101301")
+
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_calendar",
+        lambda client, yr, mo: [{"venue_name": "テスト場", "day": 10, "grade": "F2", "flags": []}],
+    )
+    monkeypatch.setattr(collect_module, "fetch_venue_year_days", lambda client, vel, yr: ["2026-03-10"])
+
+    # 2-race meeting menu from synthetic vel_menu fixture (trimmed to 2 races)
+    vel_menu_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_vel_menu_2026-11-17_46.json").read_text(encoding="utf-8"))
+    meeting_base, races_base = parse_vel_menu(vel_menu_json)
+    meeting_2r = dict(meeting_base, vel_name="テスト場", open_day="2026-03-10")
+    races_2r = [r for r in races_base if r["race_num"] in (1, 2)]
+
+    monkeypatch.setattr(collect_module, "fetch_vel_menu", lambda client, vel, date: (meeting_2r, races_2r))
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_race_info",
+        lambda client, open_day, vel, r_num: (
+            dict(r1_info, open_day=open_day, vel_code=vel, race_num=r_num),
+            [dict(e) for e in r1_entries],
+            dict(r1_pred),
+        ),
+    )
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_odds",
+        lambda client, open_day, vel, r_num, snapshot_label="": [dict(o, snapshot=snapshot_label) for o in r1_odds],
+    )
+    monkeypatch.setattr(collect_module, "fetch_nk_comments", lambda client, race_id: [])
+
+    # Case 1: 2-race day where Chariloto results only have race 1 (race 2 empty/missing)
+    # and Netkeirin has race 1 entries but race 2 entries are empty.
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_results_day",
+        lambda client, vel, date: ([dict(r) for r in r1_results], [dict(p) for p in r1_payouts], [dict(l) for l in r1_lineups]),
+    )
+
+    def mock_nk_entry_partial(client, race_id):
+        if race_id.endswith("01"):
+            return {
+                "race_id": race_id,
+                "lineup": nk_parsed["lineup"],
+                "entries": [dict(e) for e in nk_parsed["entries"]],
+                "honshi": nk_parsed["honshi"],
+            }
+        return {"race_id": race_id, "lineup": None, "entries": [], "honshi": None}
+
+    monkeypatch.setattr(collect_module, "fetch_nk_entry", mock_nk_entry_partial)
+
+    data_dir_partial = tmp_path / "data_partial"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["collect.py", "--start", "2026-03-10", "--end", "2026-03-10", "--venues", "13", "--data-dir", str(data_dir_partial)],
+    )
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        collect_module.main()
+
+    st_partial = ParquetStorage(data_dir=data_dir_partial)
+    assert not st_partial.is_done("13", "2026-03-10", "chariloto")
+    assert not st_partial.is_done("13", "2026-03-10", "netkeirin")
+    assert st_partial.is_done("13", "2026-03-10", "weather")
+
+    # Case 2: Race 2 is explicitly cancelled in vel_menu -> both Chariloto and Netkeirin succeed with Race 1 only
+    races_2r_cancelled = [
+        races_2r[0],
+        dict(races_2r[1], event_name="開催中止"),
+    ]
+    monkeypatch.setattr(collect_module, "fetch_vel_menu", lambda client, vel, date: (meeting_2r, races_2r_cancelled))
+
+    data_dir_cancelled = tmp_path / "data_cancelled"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["collect.py", "--start", "2026-03-10", "--end", "2026-03-10", "--venues", "13", "--data-dir", str(data_dir_cancelled)],
+    )
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        collect_module.main()
+
+    st_cancelled = ParquetStorage(data_dir=data_dir_cancelled)
+    assert st_cancelled.is_done("13", "2026-03-10", "chariloto")
+    assert st_cancelled.is_done("13", "2026-03-10", "netkeirin")
+
+
+def test_edge_month_completion_and_select_backfill_month(tmp_path: pathlib.Path, monkeypatch):
+    # 1) Edge month completion in collect.py when configured range ends mid-month (2026-11-16)
+    venues_config = {
+        "13": {
+            "vel_code": "13",
+            "name": "テスト場",
+            "is_indoor": True,
+        }
+    }
+    range_file = tmp_path / "backfill_range.txt"
+    range_file.write_text("2025-01-01,2026-11-16\n", encoding="utf-8")
+
+    # Venue has scheduled days on 2026-11-10 (inside range) and 2026-11-20 (outside range)
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_calendar",
+        lambda client, yr, mo: [{"venue_name": "テスト場", "day": 10, "grade": "F2", "flags": []}],
+    )
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_venue_year_days",
+        lambda client, vel, yr: ["2026-11-10", "2026-11-20"],
+    )
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_vel_menu",
+        lambda client, vel, d: ({"vel_name": "テスト場", "open_day": d}, [{"race_num": 1}]),
+    )
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_results_day",
+        lambda client, vel, d: (
+            [{"open_day": d, "vel_code": vel, "race_num": 1, "car_num": 1, "rank": 1}],
+            [{"open_day": d, "vel_code": vel, "race_num": 1, "bet_type": "nirentan", "combo": "1-2", "payout_yen": 500}],
+            [{"open_day": d, "vel_code": vel, "race_num": 1, "lineup": "1-2", "line_count": 1}],
+        ),
+    )
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_race_info",
+        lambda client, open_day, vel, r_num: (
+            {"open_day": open_day, "vel_code": vel, "race_num": r_num},
+            [{"entry_num": 1, "name": "テスト選手A"}],
+            {"marks": "1:◎", "sequences": "1-2", "comment": "ok"},
+        ),
+    )
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_odds",
+        lambda client, open_day, vel, r_num, snapshot_label="": [
+            {"bet_type": "nirentan", "combo": "1-2", "odds_min": 2.0, "odds_max": 2.0, "snapshot": snapshot_label}
+        ],
+    )
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_nk_entry",
+        lambda client, race_id: {
+            "race_id": race_id,
+            "lineup": "1-2",
+            "entries": [{"car_num": 1, "name": "テスト選手A"}],
+            "honshi": {"opinion": "ok", "bets": ["1-2"]},
+        },
+    )
+    monkeypatch.setattr(collect_module, "fetch_nk_comments", lambda client, race_id: [])
+
+    data_dir = tmp_path / "data"
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config" / "backfill_range.txt").write_text("2025-01-01,2026-11-16\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["collect.py", "--start", "2026-11-01", "--end", "2026-11-16", "--venues", "13", "--data-dir", str(data_dir)],
+    )
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        collect_module.main()
+
+    st = ParquetStorage(data_dir=data_dir)
+    assert st.is_done("13", "2026-11-10", "chariloto")
+    assert not st.is_done("13", "2026-11-20", "chariloto")
+    assert st.is_done("*", "2026-11-01", "month_complete")
+
+    # 2) select_backfill_month marker selection, deferred vs complete
+    done_dir = tmp_path / "done_test"
+    r_file = tmp_path / "range_short.txt"
+    r_file.write_text("2026-10-15,2026-11-16\n", encoding="utf-8")
+
+    # When 2026-10 is not complete and jst_today is 2026-11-25 (daily_from = 2026-11-01):
+    sel1 = collect_module.select_backfill_month(range_file=r_file, done_dir=done_dir, jst_today=date(2026, 11, 25))
+    assert sel1["status"] == "selected"
+    assert sel1["ym"] == "2026-10"
+    assert sel1["start"] == "2026-10-15"
+    assert sel1["end"] == "2026-10-31"
+    assert sel1["done_inc"] == "_done/2026/2026-10*.txt"
+    assert sel1["parquet_inc"] == "*/2026/2026-10.parquet"
+
+    # Mark 2026-10 complete; 2026-11 is still incomplete, but owned by daily-fetch on 2026-11-25 -> deferred
+    oct_done = done_dir / "2026" / "2026-10.txt"
+    oct_done.parent.mkdir(parents=True, exist_ok=True)
+    oct_done.write_text("*|2026-10-01|month_complete\n", encoding="utf-8")
+
+    sel2 = collect_module.select_backfill_month(range_file=r_file, done_dir=done_dir, jst_today=date(2026, 11, 25))
+    assert sel2["status"] == "deferred"
+    assert sel2["done"] == "1"
+    assert sel2["deferred"] == "1"
+    assert sel2["ym"] == "2026-11"
+
+    # Once jst_today moves to 2026-12-02 (daily_from = 2026-12-01), 2026-11 is selected with edge end 2026-11-16
+    sel3 = collect_module.select_backfill_month(range_file=r_file, done_dir=done_dir, jst_today=date(2026, 12, 2))
+    assert sel3["status"] == "selected"
+    assert sel3["ym"] == "2026-11"
+    assert sel3["start"] == "2026-11-01"
+    assert sel3["end"] == "2026-11-16"
+    assert sel3["done_inc"] == "_done/2026/2026-11*.txt"
+
+    # Mark 2026-11 complete -> status is complete (even if jst_today was still in Nov 2026)
+    nov_done = done_dir / "2026" / "2026-11.txt"
+    nov_done.write_text("*|2026-11-01|month_complete\n", encoding="utf-8")
+
+    sel4 = collect_module.select_backfill_month(range_file=r_file, done_dir=done_dir, jst_today=date(2026, 11, 25))
+    assert sel4["status"] == "complete"
+    assert sel4["done"] == "1"
+    assert sel4["deferred"] == "0"

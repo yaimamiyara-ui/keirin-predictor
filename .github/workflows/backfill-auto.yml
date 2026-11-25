@@ -29,36 +29,24 @@ jobs:
         id: month
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
-          import datetime, pathlib
-          s, e = open("config/backfill_range.txt").read().strip().split(",")
-          s, e = datetime.date.fromisoformat(s), datetime.date.fromisoformat(e)
-          cur = s.replace(day=1)
-          # 日次取得（daily-fetch）が書き込む最近の月（前日を含む月以降）には触らない。
-          # 2つのジョブが同じ月のファイルを上書きし合わないようにするため
-          jst_today = (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).date()
-          daily_from = (jst_today - datetime.timedelta(days=1)).replace(day=1)
-          while cur <= e and cur < daily_from:
-              f = pathlib.Path(f"data/_done/{cur:%Y}/{cur:%Y-%m}.txt")
-              if not (f.exists() and f"*|{cur:%Y-%m}-01|month_complete" in f.read_text()):
-                  nxt = (cur.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
-                  print(f"start={max(s, cur)}")
-                  print(f"end={min(e, nxt - datetime.timedelta(days=1))}")
-                  print(f"ym={cur:%Y-%m}")
-                  print(f"y={cur:%Y}")
-                  break
-              cur = (cur.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
-          else:
-              print("done=1")
+          from keirin.scripts.collect import select_backfill_month
+          for k, v in select_backfill_month().items():
+              print(f"{k}={v}")
           PY
-      - name: 全期間取得済み
+      - name: 全期間取得済みまたは日次取得の対象月
         if: steps.month.outputs.done == '1'
-        run: echo "config/backfill_range.txt の期間はすべて取得済みです。期間を書き換えるか、このワークフローを無効にしてください。"
+        run: |
+          if [ "${{ steps.month.outputs.deferred }}" = "1" ]; then
+            echo "deferred: month owned by daily-fetch (${{ steps.month.outputs.ym }})。残りの月は日次取得（daily-fetch）が担当するため、遡り取得は待機します。"
+          else
+            echo "range complete: config/backfill_range.txt の期間はすべて取得済みです。期間を書き換えるか、このワークフローを無効にしてください。"
+          fi
       - name: その月のParquetをDriveから取得
         id: pull_parquet
         if: steps.month.outputs.done != '1'
         run: |
-          rclone copy gdrive:keirin-predictor/data data --include "*/${{ steps.month.outputs.y }}/${{ steps.month.outputs.ym }}.parquet"
-          rclone check gdrive:keirin-predictor/data data --one-way --include "*/${{ steps.month.outputs.y }}/${{ steps.month.outputs.ym }}.parquet"
+          rclone copy gdrive:keirin-predictor/data data --include "${{ steps.month.outputs.parquet_inc }}"
+          rclone check gdrive:keirin-predictor/data data --one-way --include "${{ steps.month.outputs.parquet_inc }}"
       - name: 取得
         if: steps.month.outputs.done != '1' && steps.pull_parquet.outcome == 'success'
         run: python -m keirin.scripts.collect --start "${{ steps.month.outputs.start }}" --end "${{ steps.month.outputs.end }}" --max-minutes 300
@@ -67,10 +55,10 @@ jobs:
         if: always() && steps.month.outputs.done != '1' && steps.pull_done.outcome == 'success' && steps.pull_parquet.outcome == 'success'
         run: |
           if [ -d data ]; then
-            rclone copy data gdrive:keirin-predictor/data --exclude "_done/**"
-            rclone check data gdrive:keirin-predictor/data --one-way --exclude "_done/**"
-            rclone copy data gdrive:keirin-predictor/data --include "_done/**"
-            rclone check data gdrive:keirin-predictor/data --one-way --include "_done/**"
+            rclone copy data gdrive:keirin-predictor/data --include "${{ steps.month.outputs.parquet_inc }}"
+            rclone check data gdrive:keirin-predictor/data --one-way --include "${{ steps.month.outputs.parquet_inc }}"
+            rclone copy data gdrive:keirin-predictor/data --include "${{ steps.month.outputs.done_inc }}"
+            rclone check data gdrive:keirin-predictor/data --one-way --include "${{ steps.month.outputs.done_inc }}"
           fi
       - name: 進捗確認
         id: check_progress

@@ -27,7 +27,7 @@ jobs:
           Y=$(TZ=Asia/Tokyo date -d yesterday +%Y-%m-%d); T=$(TZ=Asia/Tokyo date +%Y-%m-%d)
           echo "y=$Y" >> "$GITHUB_OUTPUT"; echo "t=$T" >> "$GITHUB_OUTPUT"
           echo "inc1=*/${Y:0:4}/${Y:0:7}.parquet" >> "$GITHUB_OUTPUT"; echo "inc2=*/${T:0:4}/${T:0:7}.parquet" >> "$GITHUB_OUTPUT"
-          echo "dn1=_done/${Y:0:4}/${Y:0:7}.txt" >> "$GITHUB_OUTPUT"; echo "dn2=_done/${T:0:4}/${T:0:7}.txt" >> "$GITHUB_OUTPUT"
+          echo "dn1=_done/${Y:0:4}/${Y:0:7}*.txt" >> "$GITHUB_OUTPUT"; echo "dn2=_done/${T:0:4}/${T:0:7}*.txt" >> "$GITHUB_OUTPUT"
       - name: その月のデータをDriveから取得
         id: pull
         run: |
@@ -47,8 +47,8 @@ jobs:
         if: always() && steps.pull.outcome == 'success'
         run: |
           if [ -d data ]; then
-            rclone copy data gdrive:keirin-predictor/data --exclude "_done/**"
-            rclone check data gdrive:keirin-predictor/data --one-way --exclude "_done/**"
-            rclone copy data gdrive:keirin-predictor/data --include "_done/**"
-            rclone check data gdrive:keirin-predictor/data --one-way --include "_done/**"
+            rclone copy data gdrive:keirin-predictor/data --include "${{ steps.d.outputs.inc1 }}" --include "${{ steps.d.outputs.inc2 }}"
+            rclone check data gdrive:keirin-predictor/data --one-way --include "${{ steps.d.outputs.inc1 }}" --include "${{ steps.d.outputs.inc2 }}"
+            rclone copy data gdrive:keirin-predictor/data --include "${{ steps.d.outputs.dn1 }}" --include "${{ steps.d.outputs.dn2 }}"
+            rclone check data gdrive:keirin-predictor/data --one-way --include "${{ steps.d.outputs.dn1 }}" --include "${{ steps.d.outputs.dn2 }}"
           fi
