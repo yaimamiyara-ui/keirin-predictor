@@ -21,7 +21,7 @@ from keirin.fetch.http import PoliteClient, PoliteError, PoliteRateLimitError
 from keirin.fetch.jma import fetch_jma_10min, normalize_jma_time
 from keirin.fetch.netkeirin import fetch_nk_comments, fetch_nk_entry, make_race_id
 from keirin.fetch.openmeteo import fetch_openmeteo_hourly
-from keirin.storage import ParquetStorage, StorageError
+from keirin.storage import ParquetStorage, StorageError, is_valid_weather_time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -931,12 +931,17 @@ def main() -> None:
                                 w_data = fetch_jma_10min(polite_client, jma_station, open_day)
                                 if not w_data:
                                     raise ValueError("Empty JMA 10min weather result")
+                                jma_rows = []
                                 for w in w_data:
                                     w["time"] = normalize_jma_time(open_day, str(w.get("time", "")))
                                     w["open_day"] = open_day
                                     w["vel_code"] = vel_code
                                     w["source"] = "jma"
-                                    weather_rows.append(w)
+                                    jma_rows.append(w)
+                                # 時刻が正しい行が1件もなければ失敗として Open-Meteo に切り替える
+                                if not any(is_valid_weather_time(w.get("time")) for w in jma_rows):
+                                    raise ValueError("JMA 10min weather has no rows with a valid time")
+                                weather_rows.extend(jma_rows)
                                 jma_success = True
                             except PoliteRateLimitError as e:
                                 logger.warning(f"JMA rate-limited for {vel_code} {open_day}: {e}; skipping JMA")
@@ -961,6 +966,8 @@ def main() -> None:
                                 except Exception as e:
                                     logger.warning(f"OpenMeteo weather failed for {vel_code} {open_day}: {e}")
 
+                        # 保存されるのは時刻が正しい行だけ。有効な行が0件なら完了にしない
+                        weather_rows = [w for w in weather_rows if is_valid_weather_time(w.get("time"))]
                         if weather_rows:
                             consecutive_errors = 0
                             storage.save("weather", open_day, weather_rows)

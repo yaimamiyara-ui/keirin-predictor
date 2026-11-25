@@ -1122,3 +1122,43 @@ def test_empty_menu_with_all_sources_closes_day_and_advances_month(tmp_path: pat
     assert sel["status"] == "selected" and sel["ym"] == "2026-04"
     sources = {g["source"] for g in st.get_month_gaps("2026-03")}
     assert sources == {"chariloto", "netkeirin"}
+
+
+@pytest.mark.parametrize("om_valid", [True, False])
+def test_weather_day_without_valid_times_falls_back_and_is_not_marked_done(tmp_path: pathlib.Path, monkeypatch, om_valid):
+    """JMA rows that all have invalid times fall back to Open-Meteo; with no valid row at all the day is not done."""
+    venues_config = {"13": {"vel_code": "13", "name": "テスト場", "is_indoor": False,
+                            "jma": {"prec_no": "1", "block_no": "1"}, "lat": 35.0, "lon": 139.0}}
+    monkeypatch.setattr(collect_module, "fetch_calendar",
+                        lambda client, yr, mo: [{"venue_name": "テスト場", "day": 10, "grade": "F2", "flags": []}])
+    monkeypatch.setattr(collect_module, "fetch_venue_year_days", lambda client, vel, yr: ["2026-03-10"])
+    monkeypatch.setattr(collect_module, "fetch_jma_10min", lambda client, station, day: [
+        {"time": "24:10", "wind_speed": 1.0}, {"time": "12:99", "wind_speed": 2.0}])
+    om_calls = []
+
+    def om(client, lat, lon, start, end):
+        om_calls.append(start)
+        t = "2026-03-10T12:00" if om_valid else "2026-03-10T25:00"
+        return [{"time": t, "temperature": 10.0}]
+
+    monkeypatch.setattr(collect_module, "fetch_openmeteo_hourly", om)
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr("sys.argv", ["collect.py", "--start", "2026-03-01", "--end", "2026-03-31", "--venues", "13",
+                                     "--data-dir", str(data_dir), "--sources", "weather"])
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        try:
+            collect_module.main()
+        except SystemExit:
+            pass
+
+    st = ParquetStorage(data_dir=data_dir)
+    assert om_calls == ["2026-03-10"]
+    w_path = data_dir / "weather" / "2026" / "2026-03.parquet"
+    if om_valid:
+        assert st.is_done("13", "2026-03-10", "weather")
+        saved = pd.read_parquet(w_path)
+        assert list(saved["time"]) == ["2026-03-10T12:00"] and list(saved["source"]) == ["openmeteo"]
+    else:
+        assert not st.is_done("13", "2026-03-10", "weather")
+        assert not w_path.exists()
