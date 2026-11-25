@@ -1076,3 +1076,49 @@ def test_invalid_weather_times_are_never_written(tmp_path: pathlib.Path):
     ])
     saved = pd.read_parquet(tmp_path / "data2" / "weather" / "2026" / "2026-03.parquet")
     assert list(saved["time"]) == ["2026-03-10T00:20"]
+
+
+def test_empty_menu_with_all_sources_closes_day_and_advances_month(tmp_path: pathlib.Path, monkeypatch):
+    """A permanently empty menu is counted per day for chariloto AND netkeirin, so the month completes and backfill moves on."""
+    venues_config = {"13": {"vel_code": "13", "name": "テスト場", "is_indoor": True}}
+    vel_menu_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_vel_menu_2026-11-17_46.json").read_text(encoding="utf-8"))
+    meeting_base, _ = parse_vel_menu(vel_menu_json)
+    meeting = dict(meeting_base, vel_name="テスト場", open_day="2026-03-10")
+
+    monkeypatch.setattr(collect_module, "fetch_calendar",
+                        lambda client, yr, mo: [{"venue_name": "テスト場", "day": 10, "grade": "F2", "flags": []}])
+    monkeypatch.setattr(collect_module, "fetch_venue_year_days", lambda client, vel, yr: ["2026-03-10"])
+    monkeypatch.setattr(collect_module, "_is_confirmed_no_races", lambda m, races: False)
+    menu_calls = []
+
+    def empty_menu(client, vel, date_str):
+        menu_calls.append(date_str)
+        return meeting, []
+
+    monkeypatch.setattr(collect_module, "fetch_vel_menu", empty_menu)
+    monkeypatch.setattr(collect_module, "fetch_results_day", lambda client, vel, date_str: ([], [], []))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    range_file = tmp_path / "config" / "backfill_range.txt"
+    range_file.write_text("2026-03-01,2026-04-30\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    argv = ["collect.py", "--start", "2026-03-01", "--end", "2026-03-31", "--venues", "13",
+            "--data-dir", str(data_dir), "--max-retries", "3"]  # default sources: chariloto, netkeirin, weather
+
+    for run in range(1, 4):
+        monkeypatch.setattr("sys.argv", list(argv))
+        with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+            try:
+                collect_module.main()
+            except SystemExit:
+                pass
+        st = ParquetStorage(data_dir=data_dir)
+        closed = st.is_done("13", "2026-03-10", "netkeirin") and st.is_done("13", "2026-03-10", "chariloto")
+        assert closed == (run == 3), f"run {run}"
+
+    assert st.is_done("*", "2026-03-01", "month_complete")
+    sel = collect_module.select_backfill_month(range_file=range_file, done_dir=data_dir / "_done",
+                                               jst_today=date(2026, 11, 25))
+    assert sel["status"] == "selected" and sel["ym"] == "2026-04"
+    sources = {g["source"] for g in st.get_month_gaps("2026-03")}
+    assert sources == {"chariloto", "netkeirin"}
