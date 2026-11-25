@@ -841,3 +841,58 @@ def test_rate_limit_mid_day_does_not_mark_unsaved_races_done(tmp_path: pathlib.P
     for rn in (1, 2):
         if st.is_race_done("13", "2026-03-10", "chariloto", rn):
             assert rn in saved, f"R{rn} is marked done but its rows were never saved"
+
+
+@pytest.mark.parametrize("case", ["empty_results", "empty_menu"])
+def test_whole_day_gap_respects_retry_limit_and_closes_day(tmp_path: pathlib.Path, monkeypatch, case):
+    """Results empty for the whole day (or an empty menu) are counted per race / per day and close after the limit."""
+    venues_config = {"13": {"vel_code": "13", "name": "テスト場", "is_indoor": True}}
+    race_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_race_info_2026-03-10_13_1.json").read_text(encoding="utf-8"))
+    r1_info, r1_entries, r1_pred = parse_race_info(race_json)
+    odds_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_odds_final_2016-01-03_13_1.json").read_text(encoding="utf-8"))
+    r1_odds = parse_odds(odds_json, snapshot_label="final")
+    vel_menu_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_vel_menu_2026-11-17_46.json").read_text(encoding="utf-8"))
+    meeting_base, races_base = parse_vel_menu(vel_menu_json)
+    meeting_2r = dict(meeting_base, vel_name="テスト場", open_day="2026-03-10")
+    races_2r = [r for r in races_base if r["race_num"] in (1, 2)] if case == "empty_results" else [{"race_num": None}]
+
+    monkeypatch.setattr(collect_module, "fetch_calendar",
+                        lambda client, yr, mo: [{"venue_name": "テスト場", "day": 10, "grade": "F2", "flags": []}])
+    monkeypatch.setattr(collect_module, "fetch_venue_year_days", lambda client, vel, yr: ["2026-03-10"])
+    monkeypatch.setattr(collect_module, "_is_confirmed_no_races", lambda meeting, races: False)
+    monkeypatch.setattr(collect_module, "fetch_vel_menu", lambda client, vel, date_str: (meeting_2r, races_2r))
+    results_calls = []
+
+    def empty_results(client, vel, date_str):
+        results_calls.append(date_str)
+        return [], [], []
+
+    monkeypatch.setattr(collect_module, "fetch_results_day", empty_results)
+    monkeypatch.setattr(collect_module, "fetch_race_info", lambda client, open_day, vel, r_num: (
+        dict(r1_info, open_day=open_day, vel_code=vel, race_num=r_num), [dict(e) for e in r1_entries], dict(r1_pred)))
+    monkeypatch.setattr(collect_module, "fetch_odds",
+                        lambda client, open_day, vel, r_num, snapshot_label="": [dict(o) for o in r1_odds])
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    argv = ["collect.py", "--start", "2026-03-01", "--end", "2026-03-31", "--venues", "13",
+            "--data-dir", str(data_dir), "--sources", "chariloto", "--max-retries", "3"]
+
+    for run in range(1, 5):
+        monkeypatch.setattr("sys.argv", list(argv))
+        with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+            try:
+                collect_module.main()
+            except SystemExit:
+                pass
+        st = ParquetStorage(data_dir=data_dir)
+        if run < 3:
+            assert not st.is_done("13", "2026-03-10", "chariloto"), f"closed too early on run {run}"
+        else:
+            assert st.is_done("13", "2026-03-10", "chariloto"), f"not closed on run {run}"
+
+    # the day is not fetched again once it is closed with known gaps
+    assert len(results_calls) == 3
+    done_text = (data_dir / "_done" / "2026" / "2026-03.txt").read_text(encoding="utf-8")
+    assert "13|2026-03-10|chariloto|known_gaps=" in done_text
+    gaps = ParquetStorage(data_dir=data_dir).get_month_gaps("2026-03")
+    assert gaps and all(g["status"] == "unavailable" for g in gaps)
