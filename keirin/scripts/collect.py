@@ -155,6 +155,10 @@ def _is_race_cancelled_or_not_sold(
 RACE_MAX_RETRIES = 3
 
 
+class DayLevelGap(ValueError):
+    """A scheduled day whose menu or results stay unreadable as a whole (counted per day, with a retry limit)."""
+
+
 def select_backfill_month(
     range_file: pathlib.Path = pathlib.Path("config/backfill_range.txt"),
     done_dir: pathlib.Path = pathlib.Path("data/_done"),
@@ -474,7 +478,7 @@ def main() -> None:
                     else:
                         menu_races = [r for r in races_menu if r.get("race_num")]
                         if not menu_races:
-                            raise ValueError(f"Empty vel_menu races for Chariloto on scheduled day {vel_code} {open_day}")
+                            raise DayLevelGap("empty vel_menu races")
 
                         menu_by_num = {r["race_num"]: r for r in menu_races}
                         expected_r_nums = sorted(list(set(
@@ -486,8 +490,10 @@ def main() -> None:
                             logger.info(f"All menu races cancelled for Chariloto {vel_code} {open_day}")
                             storage.add_done(vel_code, open_day, "chariloto")
                         else:
-                            if not res_list or not r_num_set:
-                                raise ValueError(f"Empty Chariloto results for scheduled day {vel_code} {open_day}")
+                            if not expected_r_nums and not r_num_set:
+                                # 予定レースも結果のレース番号も読めない日は、日単位で数える
+                                raise DayLevelGap("results without readable race numbers")
+                            # 予定レースがあれば、結果が空でもレースごとの失敗として数える（回数の上限が効く）
 
                             res_by_race: Dict[int, List[Dict[str, Any]]] = {}
                             for row in res_list:
@@ -699,6 +705,22 @@ def main() -> None:
                     logger.warning(f"Chariloto rate-limited for {vel_code} {open_day}: {e}; skipping chariloto until next run")
                     skipped_sources.add("chariloto")
                     any_failure = True
+                except DayLevelGap as e:
+                    rec = storage.record_race_failure(
+                        vel_code, open_day, "chariloto", "day", str(e), max_retries=args.max_retries,
+                    )
+                    if rec["status"] == "unavailable":
+                        logger.warning(
+                            f"Closing Chariloto {vel_code} {open_day} with a day-level gap after "
+                            f"{rec['attempts']} attempts: {rec['reason']}"
+                        )
+                        storage.add_done(vel_code, open_day, "chariloto", detail=f"known_gaps=day:{rec['reason']}")
+                    else:
+                        logger.warning(
+                            f"Chariloto day incomplete (attempt {rec['attempts']}/{args.max_retries}): "
+                            f"{vel_code} {open_day} ({rec['reason']})"
+                        )
+                        any_failure = True
                 except Exception as e:
                     logger.error(f"Chariloto failed for {vel_code} {open_day}: {e}")
                     check_error_threshold()
