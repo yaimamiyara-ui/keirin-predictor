@@ -84,8 +84,14 @@ def test_collect_script_normal_and_partial_failure(tmp_path: pathlib.Path, monke
             {"open_day": date, "vel_code": vel, "race_num": 1, "car_num": 1, "rank": 1},
             {"open_day": date, "vel_code": vel, "race_num": 2, "car_num": 1, "rank": 1},
         ]
-        payouts = [{"open_day": date, "vel_code": vel, "race_num": 1, "bet_type": "nirentan", "combo": "1-2", "payout_yen": 500}]
-        lineups = [{"open_day": date, "vel_code": vel, "race_num": 1, "lineup": "1-2-3", "line_count": 1}]
+        payouts = [
+            {"open_day": date, "vel_code": vel, "race_num": 1, "bet_type": "nirentan", "combo": "1-2", "payout_yen": 500},
+            {"open_day": date, "vel_code": vel, "race_num": 2, "bet_type": "nirentan", "combo": "1-2", "payout_yen": 600},
+        ]
+        lineups = [
+            {"open_day": date, "vel_code": vel, "race_num": 1, "lineup": "1-2-3", "line_count": 1},
+            {"open_day": date, "vel_code": vel, "race_num": 2, "lineup": "1-2-3", "line_count": 1},
+        ]
         return res, payouts, lineups
 
     def mock_fetch_vel_menu(client, vel, date):
@@ -670,3 +676,268 @@ def test_weather_time_unification_and_migration(tmp_path: pathlib.Path, monkeypa
     assert res2[0]["converted"] == 0
     assert res2[0]["duplicates_removed"] == 0
     pd.testing.assert_frame_equal(pd.read_parquet(mig_file), after_df)
+
+def test_2race_empty_final_odds_partial_save_retry_limit_and_next_month(tmp_path: pathlib.Path, monkeypatch):
+    """
+    Tests High 1 & High 2:
+    - A 2-race day where race 2's final odds are empty is NOT marked complete for chariloto,
+      while race 1's fetched data IS saved to Parquet and marked done in the per-month progress file.
+    - On the next run, only race 2 is re-fetched (race 1 is skipped).
+    - After the retry limit (3 attempts across runs), race 2 is marked 'unavailable' with reason,
+      the day and month close as complete with known gaps recorded in the progress and marker files,
+      previously saved race 1 data is preserved, and select_backfill_month advances to the next month.
+    - Explicit cancelled / not-sold races (detected from race_info status or menu) complete immediately
+      without requiring final odds or retries.
+    """
+    venues_config = {
+        "13": {
+            "vel_code": "13",
+            "name": "テスト場",
+            "is_indoor": True,
+        }
+    }
+
+    res_html = (SYNTHETIC_FIXTURES_DIR / "synthetic_results_day_13_2026-03-10.html").read_text(encoding="utf-8")
+    r1_results, r1_payouts, r1_lineups = parse_results_day(res_html, vel="13", date="2026-03-10")
+    r2_results = [dict(r, race_num=2) for r in r1_results]
+    r2_payouts = [dict(p, race_num=2) for p in r1_payouts]
+    r2_lineups = [dict(l, race_num=2) for l in r1_lineups]
+
+    race_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_race_info_2026-03-10_13_1.json").read_text(encoding="utf-8"))
+    r1_info, r1_entries, r1_pred = parse_race_info(race_json)
+
+    odds_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_odds_final_2016-01-03_13_1.json").read_text(encoding="utf-8"))
+    r1_odds = parse_odds(odds_json, snapshot_label="final")
+
+    nk_html = (SYNTHETIC_FIXTURES_DIR / "synthetic_nk_entry_ex.html").read_text(encoding="utf-8")
+    nk_parsed = parse_nk_entry(nk_html, "202603101301")
+
+    vel_menu_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_vel_menu_2026-11-17_46.json").read_text(encoding="utf-8"))
+    meeting_base, races_base = parse_vel_menu(vel_menu_json)
+    meeting_2r = dict(meeting_base, vel_name="テスト場", open_day="2026-03-10")
+    races_2r = [r for r in races_base if r["race_num"] in (1, 2)]
+
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_calendar",
+        lambda client, yr, mo: [{"venue_name": "テスト場", "day": 10, "grade": "F2", "flags": []}],
+    )
+    monkeypatch.setattr(collect_module, "fetch_venue_year_days", lambda client, vel, yr: ["2026-03-10"])
+    monkeypatch.setattr(collect_module, "fetch_vel_menu", lambda client, vel, date_str: (meeting_2r, races_2r))
+    monkeypatch.setattr(
+        collect_module,
+        "fetch_results_day",
+        lambda client, vel, date_str: (
+            [dict(r) for r in (r1_results + r2_results)],
+            [dict(p) for p in (r1_payouts + r2_payouts)],
+            [dict(l) for l in (r1_lineups + r2_lineups)],
+        ),
+    )
+
+    fetched_chariloto_races = []
+    fetched_odds_races = []
+    fetched_nk_races = []
+
+    def mock_fetch_race_info(client, open_day, vel, r_num):
+        fetched_chariloto_races.append(r_num)
+        return (
+            dict(r1_info, open_day=open_day, vel_code=vel, race_num=r_num),
+            [dict(e) for e in r1_entries],
+            dict(r1_pred),
+        )
+
+    def mock_fetch_odds_r2_empty(client, open_day, vel, r_num, snapshot_label=""):
+        fetched_odds_races.append(r_num)
+        if r_num == 1:
+            return [dict(o, snapshot=snapshot_label) for o in r1_odds]
+        return []  # Race 2 final odds permanently empty
+
+    def mock_fetch_nk_entry(client, race_id):
+        r_num = int(race_id[-2:])
+        fetched_nk_races.append(r_num)
+        return {
+            "race_id": race_id,
+            "lineup": nk_parsed["lineup"],
+            "entries": [dict(e) for e in nk_parsed["entries"]],
+            "honshi": nk_parsed["honshi"],
+        }
+
+    monkeypatch.setattr(collect_module, "fetch_race_info", mock_fetch_race_info)
+    monkeypatch.setattr(collect_module, "fetch_odds", mock_fetch_odds_r2_empty)
+    monkeypatch.setattr(collect_module, "fetch_nk_entry", mock_fetch_nk_entry)
+    monkeypatch.setattr(collect_module, "fetch_nk_comments", lambda client, race_id: [])
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+    range_file = tmp_path / "config" / "backfill_range.txt"
+    range_file.write_text("2026-03-01,2026-04-30\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+
+    # --- Run 1 (Attempt 1/3 for Race 2) ---
+    monkeypatch.setattr(
+        "sys.argv",
+        ["collect.py", "--start", "2026-03-01", "--end", "2026-03-31", "--venues", "13", "--data-dir", str(data_dir)],
+    )
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        collect_module.main()
+
+    st = ParquetStorage(data_dir=data_dir)
+    # Race 1 and Race 2 were both fetched on Run 1
+    assert fetched_chariloto_races == [1, 2]
+    assert fetched_odds_races == [1, 2]
+    assert fetched_nk_races == [1, 2]
+
+    # Chariloto day and month are NOT complete because R2 final odds were empty
+    assert not st.is_done("13", "2026-03-10", "chariloto")
+    assert st.is_done("13", "2026-03-10", "netkeirin")
+    assert st.is_done("13", "2026-03-10", "weather")
+    assert not st.is_done("*", "2026-03-01", "month_complete")
+
+    # Race 1 data was saved and not lost
+    df_race = pd.read_parquet(data_dir / "race" / "2026" / "2026-03.parquet")
+    df_odds = pd.read_parquet(data_dir / "odds" / "2026" / "2026-03.parquet")
+    assert set(df_race["race_num"].tolist()) == {1}
+    assert set(df_odds["race_num"].tolist()) == {1}
+
+    # Progress file records R1 done and R2 fail (attempt 1)
+    r1_prog = st.get_race_progress("13", "2026-03-10", "chariloto", 1)
+    r2_prog = st.get_race_progress("13", "2026-03-10", "chariloto", 2)
+    assert r1_prog is not None and r1_prog["status"] == "done"
+    assert r2_prog is not None and r2_prog["status"] == "fail" and r2_prog["attempts"] == 1
+    assert "final_odds" in r2_prog["reason"]
+
+    # Backfill month selector still selects 2026-03
+    sel_run1 = collect_module.select_backfill_month(range_file=range_file, done_dir=data_dir / "_done", jst_today=date(2026, 11, 25))
+    assert sel_run1["ym"] == "2026-03"
+
+    # --- Run 2 (Attempt 2/3 for Race 2): only Race 2 is re-fetched ---
+    fetched_chariloto_races.clear()
+    fetched_odds_races.clear()
+    fetched_nk_races.clear()
+
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        collect_module.main()
+
+    assert fetched_chariloto_races == [2]
+    assert fetched_odds_races == [2]
+    assert fetched_nk_races == []  # netkeirin was already done on Run 1
+    assert not st.is_done("13", "2026-03-10", "chariloto")
+    assert not st.is_done("*", "2026-03-01", "month_complete")
+    r2_prog2 = st.get_race_progress("13", "2026-03-10", "chariloto", 2)
+    assert r2_prog2 is not None and r2_prog2["status"] == "fail" and r2_prog2["attempts"] == 2
+
+    # --- Run 3 (Attempt 3/3 for Race 2): hits retry limit, marks unavailable, closes day & month ---
+    fetched_chariloto_races.clear()
+    fetched_odds_races.clear()
+
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        collect_module.main()
+
+    assert fetched_chariloto_races == [2]
+    assert fetched_odds_races == [2]
+    r2_prog3 = st.get_race_progress("13", "2026-03-10", "chariloto", 2)
+    assert r2_prog3 is not None and r2_prog3["status"] == "unavailable" and r2_prog3["attempts"] == 3
+    assert "final_odds" in r2_prog3["reason"]
+
+    # Day and month are now marked complete with known gaps
+    assert st.is_done("13", "2026-03-10", "chariloto")
+    assert st.is_done("*", "2026-03-01", "month_complete")
+
+    done_text = (data_dir / "_done" / "2026" / "2026-03.txt").read_text(encoding="utf-8")
+    assert "13|2026-03-10|chariloto|known_gaps=R2:missing final_odds" in done_text
+    assert "*|2026-03-01|month_complete|known_gaps=1" in done_text
+
+    # Previously saved Race 1 data is still intact in Parquet
+    df_race_after = pd.read_parquet(data_dir / "race" / "2026" / "2026-03.parquet")
+    df_entry_after = pd.read_parquet(data_dir / "entry" / "2026" / "2026-03.parquet")
+    df_odds_after = pd.read_parquet(data_dir / "odds" / "2026" / "2026-03.parquet")
+    assert set(df_race_after["race_num"].tolist()) == {1}
+    assert len(df_entry_after) == len(r1_entries)
+    assert len(df_odds_after) == len(r1_odds)
+
+    # Next month (2026-04) is now selected by select_backfill_month
+    sel_after = collect_module.select_backfill_month(range_file=range_file, done_dir=data_dir / "_done", jst_today=date(2026, 11, 25))
+    assert sel_after["status"] == "selected"
+    assert sel_after["ym"] == "2026-04"
+
+    # --- Explicit not-sold / cancelled race in race_info completes on first run without odds ---
+    data_dir_notsold = tmp_path / "data_notsold"
+
+    def mock_fetch_race_info_r2_notsold(client, open_day, vel, r_num):
+        info = dict(r1_info, open_day=open_day, vel_code=vel, race_num=r_num)
+        if r_num == 2:
+            for k in list(info.keys()):
+                if k.endswith("_sale_status"):
+                    info[k] = "no_sale"
+        return info, [dict(e) for e in r1_entries], dict(r1_pred)
+
+    monkeypatch.setattr(collect_module, "fetch_race_info", mock_fetch_race_info_r2_notsold)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["collect.py", "--start", "2026-03-10", "--end", "2026-03-10", "--venues", "13", "--data-dir", str(data_dir_notsold)],
+    )
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        collect_module.main()
+
+    st_notsold = ParquetStorage(data_dir=data_dir_notsold)
+    assert st_notsold.is_done("13", "2026-03-10", "chariloto")
+    r2_ns_prog = st_notsold.get_race_progress("13", "2026-03-10", "chariloto", 2)
+    assert r2_ns_prog is not None and r2_ns_prog["status"] == "done" and r2_ns_prog["reason"] == "cancelled_or_not_sold"
+
+
+
+def test_rate_limit_mid_day_does_not_mark_unsaved_races_done(tmp_path: pathlib.Path, monkeypatch):
+    """A 429 on race 2 must not leave race 1 marked done without its rows saved (no silent data loss)."""
+    venues_config = {"13": {"vel_code": "13", "name": "テスト場", "is_indoor": True}}
+
+    res_html = (SYNTHETIC_FIXTURES_DIR / "synthetic_results_day_13_2026-03-10.html").read_text(encoding="utf-8")
+    r1_results, r1_payouts, r1_lineups = parse_results_day(res_html, vel="13", date="2026-03-10")
+    r2_results = [dict(r, race_num=2) for r in r1_results]
+    r2_lineups = [dict(l, race_num=2) for l in r1_lineups]
+    race_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_race_info_2026-03-10_13_1.json").read_text(encoding="utf-8"))
+    r1_info, r1_entries, r1_pred = parse_race_info(race_json)
+    odds_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_odds_final_2016-01-03_13_1.json").read_text(encoding="utf-8"))
+    r1_odds = parse_odds(odds_json, snapshot_label="final")
+    vel_menu_json = json.loads((SYNTHETIC_FIXTURES_DIR / "synthetic_vel_menu_2026-11-17_46.json").read_text(encoding="utf-8"))
+    meeting_base, races_base = parse_vel_menu(vel_menu_json)
+    meeting_2r = dict(meeting_base, vel_name="テスト場", open_day="2026-03-10")
+    races_2r = [r for r in races_base if r["race_num"] in (1, 2)]
+
+    monkeypatch.setattr(collect_module, "fetch_calendar",
+                        lambda client, yr, mo: [{"venue_name": "テスト場", "day": 10, "grade": "F2", "flags": []}])
+    monkeypatch.setattr(collect_module, "fetch_venue_year_days", lambda client, vel, yr: ["2026-03-10"])
+    monkeypatch.setattr(collect_module, "fetch_vel_menu", lambda client, vel, date_str: (meeting_2r, races_2r))
+    monkeypatch.setattr(collect_module, "fetch_results_day", lambda client, vel, date_str: (
+        [dict(r) for r in (r1_results + r2_results)],
+        [dict(p) for p in r1_payouts],
+        [dict(l) for l in (r1_lineups + r2_lineups)],
+    ))
+    monkeypatch.setattr(collect_module, "fetch_race_info", lambda client, open_day, vel, r_num: (
+        dict(r1_info, open_day=open_day, vel_code=vel, race_num=r_num),
+        [dict(e) for e in r1_entries],
+        dict(r1_pred),
+    ))
+
+    def odds_429_on_r2(client, open_day, vel, r_num, snapshot_label=""):
+        if r_num == 2:
+            raise ChariRateLimitError("429 Retry-After too long")
+        return [dict(o, snapshot=snapshot_label) for o in r1_odds]
+
+    monkeypatch.setattr(collect_module, "fetch_odds", odds_429_on_r2)
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr("sys.argv", ["collect.py", "--start", "2026-03-01", "--end", "2026-03-31", "--venues", "13",
+                                     "--data-dir", str(data_dir), "--sources", "chariloto"])
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        try:
+            collect_module.main()
+        except SystemExit:
+            pass
+
+    st = ParquetStorage(data_dir=data_dir)
+    assert not st.is_done("13", "2026-03-10", "chariloto")
+    race_path = data_dir / "race" / "2026" / "2026-03.parquet"
+    saved = set(pd.read_parquet(race_path)["race_num"].tolist()) if race_path.exists() else set()
+    for rn in (1, 2):
+        if st.is_race_done("13", "2026-03-10", "chariloto", rn):
+            assert rn in saved, f"R{rn} is marked done but its rows were never saved"

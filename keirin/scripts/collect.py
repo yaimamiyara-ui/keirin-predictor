@@ -79,12 +79,80 @@ def _is_confirmed_no_races(meeting: Dict[str, Any], races_menu: List[Dict[str, A
 def _is_race_cancelled(race_item: Dict[str, Any]) -> bool:
     if not isinstance(race_item, dict):
         return False
-    cancel_keywords = ("中止", "順延", "開催なし", "不成立")
-    for field in ("event_name", "status", "rehold_string", "cancel_reason", "note"):
+    cancel_keywords = ("中止", "順延", "開催なし", "不成立", "発売なし", "発売無し")
+    for field in ("event_name", "status", "rehold_string", "cancel_reason", "note", "class_name", "race_name"):
         val = race_item.get(field)
         if val and any(kw in str(val) for kw in cancel_keywords):
             return True
     return False
+
+
+_BET_SALE_STATUS_FIELDS = (
+    "bet_niwakufuku_sale_status",
+    "bet_niwakutan_sale_status",
+    "bet_nirenfuku_sale_status",
+    "bet_nirentan_sale_status",
+    "bet_wide_sale_status",
+    "bet_sanrenfuku_sale_status",
+    "bet_sanrentan_sale_status",
+)
+
+_BET_RESULT_STATUS_FIELDS = (
+    "bet_niwakufuku_result_status",
+    "bet_niwakutan_result_status",
+    "bet_nirenfuku_result_status",
+    "bet_nirentan_result_status",
+    "bet_wide_result_status",
+    "bet_sanrenfuku_result_status",
+    "bet_sanrentan_result_status",
+)
+
+_NO_SALE_STATUS_VALUES = {
+    "no_sale",
+    "nosale",
+    "none",
+    "off",
+    "cancel",
+    "canceled",
+    "cancelled",
+    "not_sold",
+    "中止",
+    "不成立",
+    "発売なし",
+    "発売無し",
+}
+
+
+def _is_race_cancelled_or_not_sold(
+    r_info: Optional[Dict[str, Any]] = None,
+    menu_item: Optional[Dict[str, Any]] = None,
+    res_rows: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    if menu_item and _is_race_cancelled(menu_item):
+        return True
+    if r_info and _is_race_cancelled(r_info):
+        return True
+    if isinstance(r_info, dict) and r_info:
+        sale_vals = [r_info.get(f) for f in _BET_SALE_STATUS_FIELDS if r_info.get(f) is not None]
+        if sale_vals and all(str(v).strip().lower() in _NO_SALE_STATUS_VALUES for v in sale_vals):
+            return True
+        res_vals = [r_info.get(f) for f in _BET_RESULT_STATUS_FIELDS if r_info.get(f) is not None]
+        if res_vals and all(str(v).strip().lower() in _NO_SALE_STATUS_VALUES for v in res_vals):
+            return True
+    if res_rows:
+        cancel_keywords = ("中止", "順延", "開催なし", "不成立", "発売なし", "発売無し")
+        if all(
+            any(
+                row.get(f) and any(kw in str(row.get(f)) for kw in cancel_keywords)
+                for f in ("status", "note")
+            )
+            for row in res_rows
+        ):
+            return True
+    return False
+
+
+RACE_MAX_RETRIES = 3
 
 
 def select_backfill_month(
@@ -142,6 +210,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=str, default="data", help="Data directory path")
     parser.add_argument("--snapshot", type=str, default="final", help="Odds snapshot label")
     parser.add_argument("--today-mode", action="store_true", help="Mode for fetching today's upcoming races")
+    parser.add_argument("--max-retries", type=int, default=RACE_MAX_RETRIES, help="Max attempts across runs before marking a race unavailable")
 
     args = parser.parse_args()
 
@@ -407,6 +476,7 @@ def main() -> None:
                         if not menu_races:
                             raise ValueError(f"Empty vel_menu races for Chariloto on scheduled day {vel_code} {open_day}")
 
+                        menu_by_num = {r["race_num"]: r for r in menu_races}
                         expected_r_nums = sorted(list(set(
                             r["race_num"] for r in menu_races if not _is_race_cancelled(r)
                         )))
@@ -419,65 +489,208 @@ def main() -> None:
                             if not res_list or not r_num_set:
                                 raise ValueError(f"Empty Chariloto results for scheduled day {vel_code} {open_day}")
 
-                            missing_results = [rn for rn in expected_r_nums if rn not in r_num_set]
-                            if missing_results:
-                                raise ValueError(
-                                    f"Incomplete Chariloto results for {vel_code} {open_day}: missing races {missing_results}"
-                                )
+                            res_by_race: Dict[int, List[Dict[str, Any]]] = {}
+                            for row in res_list:
+                                rn = row.get("race_num")
+                                if rn:
+                                    res_by_race.setdefault(rn, []).append(row)
 
-                            r_rows, e_rows, p_rows, o_rows = [], [], [], []
+                            payout_by_race: Dict[int, List[Dict[str, Any]]] = {}
+                            for row in payout_list:
+                                rn = row.get("race_num")
+                                if rn:
+                                    payout_by_race.setdefault(rn, []).append(row)
+
+                            lineup_by_race: Dict[int, List[Dict[str, Any]]] = {}
+                            for row in lineup_list:
+                                rn = row.get("race_num")
+                                if rn:
+                                    row["source"] = "chariloto"
+                                    lineup_by_race.setdefault(rn, []).append(row)
+
                             races_to_fetch = sorted(list(set(expected_r_nums) | r_num_set))
+                            r_rows, e_rows, p_rows, o_rows = [], [], [], []
+                            res_to_save, payout_to_save, lineup_to_save = [], [], []
+                            chari_pending_retry = False
+                            # 保存が終わるまで取得済みの印を付けない（途中で止まっても行を失わない）
+                            chari_done_marks: List[Any] = []
 
                             for r_num in races_to_fetch:
+                                if storage.is_race_done(vel_code, open_day, "chariloto", r_num):
+                                    continue
+
                                 if time.monotonic() >= deadline:
                                     logger.info("Reached max execution time limit inside Chariloto race loop. Stopping safely.")
                                     timed_out = True
                                     break
 
-                                r_info, entries, pred = fetch_race_info(chari_client, open_day, vel_code, r_num)
-                                if not r_info or (r_num in expected_r_nums and not entries):
-                                    raise ValueError(
-                                        f"Empty Chariloto race/entry rows for {vel_code} {open_day} R{r_num}"
+                                menu_item = menu_by_num.get(r_num)
+                                race_res = res_by_race.get(r_num, [])
+                                race_pay = payout_by_race.get(r_num, [])
+                                race_lin = list(lineup_by_race.get(r_num, []))
+
+                                try:
+                                    r_info, entries, pred = fetch_race_info(chari_client, open_day, vel_code, r_num)
+                                except (ChariRateLimitError, StorageError):
+                                    raise
+                                except Exception as race_exc:
+                                    rec = storage.record_race_failure(
+                                        vel_code, open_day, "chariloto", r_num,
+                                        f"fetch_race_info failed: {race_exc}",
+                                        max_retries=args.max_retries,
                                     )
+                                    if rec["status"] == "unavailable":
+                                        logger.warning(
+                                            f"Chariloto gap marked unavailable after {rec['attempts']} attempts: "
+                                            f"{vel_code} {open_day} R{r_num} ({rec['reason']})"
+                                        )
+                                    else:
+                                        logger.warning(
+                                            f"Chariloto race incomplete (attempt {rec['attempts']}/{args.max_retries}): "
+                                            f"{vel_code} {open_day} R{r_num} ({rec['reason']})"
+                                        )
+                                        chari_pending_retry = True
+                                    continue
+
+                                if _is_race_cancelled_or_not_sold(r_info=r_info, menu_item=menu_item, res_rows=race_res):
+                                    logger.info(f"Race explicitly cancelled/not sold for Chariloto {vel_code} {open_day} R{r_num}")
+                                    if r_info:
+                                        r_info.update(meeting)
+                                        r_rows.append(r_info)
+                                    chari_done_marks.append((r_num, "cancelled_or_not_sold"))
+                                    continue
+
+                                if not race_lin:
+                                    try:
+                                        lin_info = fetch_lineup(chari_client, open_day, vel_code, r_num)
+                                        if lin_info.get("lineup"):
+                                            race_lin = [{
+                                                "open_day": open_day,
+                                                "vel_code": vel_code,
+                                                "race_num": r_num,
+                                                "source": "chariloto",
+                                                "lineup": lin_info["lineup"],
+                                                "line_count": lin_info.get("line_count"),
+                                            }]
+                                    except (ChariRateLimitError, StorageError):
+                                        raise
+                                    except Exception:
+                                        pass
+
+                                try:
+                                    odds_data = fetch_odds(chari_client, open_day, vel_code, r_num, snapshot_label=args.snapshot)
+                                except (ChariRateLimitError, StorageError):
+                                    raise
+                                except Exception as odds_exc:
+                                    rec = storage.record_race_failure(
+                                        vel_code, open_day, "chariloto", r_num,
+                                        f"fetch_odds failed: {odds_exc}",
+                                        max_retries=args.max_retries,
+                                    )
+                                    if rec["status"] == "unavailable":
+                                        logger.warning(
+                                            f"Chariloto gap marked unavailable after {rec['attempts']} attempts: "
+                                            f"{vel_code} {open_day} R{r_num} ({rec['reason']})"
+                                        )
+                                    else:
+                                        logger.warning(
+                                            f"Chariloto race incomplete (attempt {rec['attempts']}/{args.max_retries}): "
+                                            f"{vel_code} {open_day} R{r_num} ({rec['reason']})"
+                                        )
+                                        chari_pending_retry = True
+                                    continue
+
+                                missing_parts = []
+                                if not race_res:
+                                    missing_parts.append("results")
+                                if not r_info or not entries:
+                                    missing_parts.append("entries")
+                                if not race_lin:
+                                    missing_parts.append("lineup")
+                                if not odds_data:
+                                    missing_parts.append("final_odds")
+
+                                if missing_parts:
+                                    reason = f"missing {','.join(missing_parts)}"
+                                    rec = storage.record_race_failure(
+                                        vel_code, open_day, "chariloto", r_num,
+                                        reason,
+                                        max_retries=args.max_retries,
+                                    )
+                                    if rec["status"] == "unavailable":
+                                        logger.warning(
+                                            f"Chariloto gap marked unavailable after {rec['attempts']} attempts: "
+                                            f"{vel_code} {open_day} R{r_num} ({reason})"
+                                        )
+                                    else:
+                                        logger.warning(
+                                            f"Chariloto race incomplete (attempt {rec['attempts']}/{args.max_retries}): "
+                                            f"{vel_code} {open_day} R{r_num} ({reason})"
+                                        )
+                                        chari_pending_retry = True
+                                    continue
+
                                 r_info.update(meeting)
                                 r_rows.append(r_info)
-
                                 for e in entries:
                                     e["open_day"] = open_day
                                     e["vel_code"] = vel_code
                                     e["race_num"] = r_num
                                     e_rows.append(e)
-
                                 pred["open_day"] = open_day
                                 pred["vel_code"] = vel_code
                                 pred["race_num"] = r_num
                                 p_rows.append(pred)
-
-                                odds_data = fetch_odds(chari_client, open_day, vel_code, r_num, snapshot_label=args.snapshot)
                                 for od in odds_data:
                                     od["open_day"] = open_day
                                     od["vel_code"] = vel_code
                                     od["race_num"] = r_num
                                     o_rows.append(od)
+                                res_to_save.extend(race_res)
+                                payout_to_save.extend(race_pay)
+                                lineup_to_save.extend(race_lin)
+                                chari_done_marks.append((r_num, ""))
+
+                            if r_rows:
+                                storage.save("race", open_day, r_rows)
+                            if e_rows:
+                                storage.save("entry", open_day, e_rows)
+                            if p_rows:
+                                storage.save("prediction", open_day, p_rows)
+                            if o_rows:
+                                storage.save("odds", open_day, o_rows)
+                            if res_to_save:
+                                storage.save("result", open_day, res_to_save)
+                            if payout_to_save:
+                                storage.save("payout", open_day, payout_to_save)
+                            if lineup_to_save:
+                                storage.save("lineup", open_day, lineup_to_save)
+                            for done_rn, done_reason in chari_done_marks:
+                                storage.mark_race_done(vel_code, open_day, "chariloto", done_rn, reason=done_reason)
 
                             if timed_out:
                                 break
 
-                            if not r_rows or not e_rows:
-                                raise ValueError(f"Empty Chariloto race/entry rows for scheduled day {vel_code} {open_day}")
-
-                            for l in lineup_list:
-                                l["source"] = "chariloto"
-
-                            storage.save("race", open_day, r_rows)
-                            storage.save("entry", open_day, e_rows)
-                            storage.save("prediction", open_day, p_rows)
-                            storage.save("odds", open_day, o_rows)
-                            storage.save("result", open_day, res_list)
-                            storage.save("payout", open_day, payout_list)
-                            storage.save("lineup", open_day, lineup_list)
-
-                            storage.add_done(vel_code, open_day, "chariloto")
+                            all_chari_done = all(
+                                storage.is_race_done(vel_code, open_day, "chariloto", rn)
+                                for rn in races_to_fetch
+                            )
+                            if all_chari_done and not chari_pending_retry:
+                                gaps = [
+                                    storage.get_race_progress(vel_code, open_day, "chariloto", rn)
+                                    for rn in races_to_fetch
+                                ]
+                                unavail = [g for g in gaps if g and g.get("status") == "unavailable"]
+                                if unavail:
+                                    gap_desc = ";".join(f"R{g['race_num']}:{g.get('reason','')}" for g in unavail)
+                                    logger.warning(
+                                        f"Closing Chariloto {vel_code} {open_day} with known gaps: {gap_desc}"
+                                    )
+                                    storage.add_done(vel_code, open_day, "chariloto", detail=f"known_gaps={gap_desc}")
+                                else:
+                                    storage.add_done(vel_code, open_day, "chariloto")
+                            else:
+                                any_failure = True
                 except StorageError as e:
                     logger.error(f"Storage error during Chariloto save for {vel_code} {open_day}: {e}")
                     any_failure = True
@@ -515,17 +728,61 @@ def main() -> None:
                             storage.add_done(vel_code, open_day, "netkeirin")
                         else:
                             nk_e_rows, nk_c_rows, nk_l_rows = [], [], []
+                            nk_pending_retry = False
+                            nk_done_marks: List[Any] = []
                             for r_num in expected_r_nums:
+                                if storage.is_race_done(vel_code, open_day, "netkeirin", r_num):
+                                    continue
+
                                 if time.monotonic() >= deadline:
                                     logger.info("Reached max execution time limit inside Netkeirin race loop. Stopping safely.")
                                     timed_out = True
                                     break
 
                                 race_id = make_race_id(open_day, vel_code, r_num)
-                                nk_entry_data = fetch_nk_entry(polite_client, race_id)
+                                try:
+                                    nk_entry_data = fetch_nk_entry(polite_client, race_id)
+                                except (PoliteRateLimitError, StorageError):
+                                    raise
+                                except Exception as nk_exc:
+                                    rec = storage.record_race_failure(
+                                        vel_code, open_day, "netkeirin", r_num,
+                                        f"fetch_nk_entry failed: {nk_exc}",
+                                        max_retries=args.max_retries,
+                                    )
+                                    if rec["status"] == "unavailable":
+                                        logger.warning(
+                                            f"Netkeirin gap marked unavailable after {rec['attempts']} attempts: "
+                                            f"{vel_code} {open_day} R{r_num} ({rec['reason']})"
+                                        )
+                                    else:
+                                        logger.warning(
+                                            f"Netkeirin race incomplete (attempt {rec['attempts']}/{args.max_retries}): "
+                                            f"{vel_code} {open_day} R{r_num} ({rec['reason']})"
+                                        )
+                                        nk_pending_retry = True
+                                    continue
+
                                 race_entries = nk_entry_data.get("entries") or []
                                 if not race_entries:
-                                    raise ValueError(f"Empty netkeirin entries for {vel_code} {open_day} R{r_num}")
+                                    reason = "missing entries"
+                                    rec = storage.record_race_failure(
+                                        vel_code, open_day, "netkeirin", r_num,
+                                        reason,
+                                        max_retries=args.max_retries,
+                                    )
+                                    if rec["status"] == "unavailable":
+                                        logger.warning(
+                                            f"Netkeirin gap marked unavailable after {rec['attempts']} attempts: "
+                                            f"{vel_code} {open_day} R{r_num} ({reason})"
+                                        )
+                                    else:
+                                        logger.warning(
+                                            f"Netkeirin race incomplete (attempt {rec['attempts']}/{args.max_retries}): "
+                                            f"{vel_code} {open_day} R{r_num} ({reason})"
+                                        )
+                                        nk_pending_retry = True
+                                    continue
 
                                 honshi = nk_entry_data.get("honshi") or {}
                                 honshi_op = honshi.get("opinion")
@@ -555,19 +812,41 @@ def main() -> None:
                                     c["race_num"] = r_num
                                     nk_c_rows.append(c)
 
+                                nk_done_marks.append(r_num)
+
+                            if nk_e_rows:
+                                consecutive_errors = 0
+                                storage.save("nk_entry", open_day, nk_e_rows)
+                            if nk_c_rows:
+                                storage.save("nk_comment", open_day, nk_c_rows)
+                            if nk_l_rows:
+                                storage.save("lineup", open_day, nk_l_rows)
+                            for done_rn in nk_done_marks:
+                                storage.mark_race_done(vel_code, open_day, "netkeirin", done_rn)
+
                             if timed_out:
                                 break
 
-                            if not nk_e_rows:
-                                raise ValueError(f"Empty netkeirin entries for scheduled day {vel_code} {open_day}")
-
-                            consecutive_errors = 0
-                            storage.save("nk_entry", open_day, nk_e_rows)
-                            storage.save("nk_comment", open_day, nk_c_rows)
-                            if nk_l_rows:
-                                storage.save("lineup", open_day, nk_l_rows)
-
-                            storage.add_done(vel_code, open_day, "netkeirin")
+                            all_nk_done = all(
+                                storage.is_race_done(vel_code, open_day, "netkeirin", rn)
+                                for rn in expected_r_nums
+                            )
+                            if all_nk_done and not nk_pending_retry:
+                                gaps = [
+                                    storage.get_race_progress(vel_code, open_day, "netkeirin", rn)
+                                    for rn in expected_r_nums
+                                ]
+                                unavail = [g for g in gaps if g and g.get("status") == "unavailable"]
+                                if unavail:
+                                    gap_desc = ";".join(f"R{g['race_num']}:{g.get('reason','')}" for g in unavail)
+                                    logger.warning(
+                                        f"Closing Netkeirin {vel_code} {open_day} with known gaps: {gap_desc}"
+                                    )
+                                    storage.add_done(vel_code, open_day, "netkeirin", detail=f"known_gaps={gap_desc}")
+                                else:
+                                    storage.add_done(vel_code, open_day, "netkeirin")
+                            else:
+                                any_failure = True
                 except StorageError as e:
                     logger.error(f"Storage error during Netkeirin save for {vel_code} {open_day}: {e}")
                     any_failure = True
@@ -699,7 +978,21 @@ def main() -> None:
                     and bool(sources)
                     and all(storage.is_done(v, d, src) for v, d in month_days for src in sources)
                 ):
-                    storage.add_done("*", month_start, "month_complete")
+                    month_gaps = [
+                        g for g in storage.get_month_gaps(ym)
+                        if eff_start <= g.get("open_day", "") <= eff_end
+                    ]
+                    if month_gaps:
+                        gap_summary = ";".join(
+                            f"{g['vel_code']}/{g['open_day']}/{g['source']}/R{g['race_num']}:{g.get('reason','')}"
+                            for g in month_gaps
+                        )
+                        logger.warning(
+                            f"Month {ym} complete with known gaps ({len(month_gaps)} unavailable race-source items): {gap_summary}"
+                        )
+                        storage.add_done("*", month_start, "month_complete", detail=f"known_gaps={len(month_gaps)}")
+                    else:
+                        storage.add_done("*", month_start, "month_complete")
 
     # この実行で新しく取れた数をファイルに残す（0なら backfill-auto は自分を再起動しない＝空回り防止）
     try:
