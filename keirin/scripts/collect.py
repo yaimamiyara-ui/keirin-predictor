@@ -18,7 +18,7 @@ from keirin.fetch.chariloto import (
 )
 from keirin.fetch.client import ChariClient, ChariError, ChariRateLimitError
 from keirin.fetch.http import PoliteClient, PoliteError, PoliteRateLimitError
-from keirin.fetch.jma import fetch_jma_10min
+from keirin.fetch.jma import fetch_jma_10min, normalize_jma_time
 from keirin.fetch.netkeirin import fetch_nk_comments, fetch_nk_entry, make_race_id
 from keirin.fetch.openmeteo import fetch_openmeteo_hourly
 from keirin.storage import ParquetStorage, StorageError
@@ -614,7 +614,7 @@ def main() -> None:
                                 if not w_data:
                                     raise ValueError("Empty JMA 10min weather result")
                                 for w in w_data:
-                                    # 時刻の保存形式は従来どおり（JST の日時への統一は既存データの移行と合わせて別に行う）
+                                    w["time"] = normalize_jma_time(open_day, str(w.get("time", "")))
                                     w["open_day"] = open_day
                                     w["vel_code"] = vel_code
                                     w["source"] = "jma"

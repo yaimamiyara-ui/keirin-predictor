@@ -167,7 +167,7 @@ def parse_jma_10min(html: str, kind: str, date_str: str) -> List[Dict[str, Any]]
             gust_dir = g_dir_raw if g_dir_raw and g_dir_raw != "--" else None
 
         results.append({
-            "time": time_str,  # 保存形式は従来どおり（JST の日時への統一は既存データの移行と合わせて別に行う）
+            "time": normalize_jma_time(date_str, time_str),
             "wind_speed": wind_speed,
             "wind_dir": wind_dir,
             "gust_speed": gust_speed,

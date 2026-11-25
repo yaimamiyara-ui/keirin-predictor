@@ -49,13 +49,14 @@ def test_jma_10min_parsing():
 
     data = parse_jma_10min(html, kind="s", date_str="2026-03-10")
     assert len(data) > 0
-    first_row = next(r for r in data if r["time"] == "00:10")
+    first_row = next(r for r in data if r["time"] == "2026-03-10T00:10")
     assert first_row["wind_speed"] == 1.5
     assert first_row["wind_dir"] == "北"
 
     assert normalize_jma_time("2026-03-10", "00:10") == "2026-03-10T00:10"
     assert normalize_jma_time("2026-03-10", "9:00") == "2026-03-10T09:00"
     assert normalize_jma_time("2026-03-10", "24:00") == "2026-03-11T00:00"
+    assert normalize_jma_time("2026-03-10", "2026-03-10T00:10") == "2026-03-10T00:10"
 
 
 def test_jma_prec_and_stations():

@@ -1,10 +1,35 @@
 import logging
 import os
 import pathlib
+import re
 from typing import Any, Dict, List, Set, Union
 import pandas as pd
 
+from keirin.fetch.jma import normalize_jma_time
+
 logger = logging.getLogger(__name__)
+
+_HHMM_RE = re.compile(r"^\d{1,2}:\d{2}$")
+
+
+def normalize_weather_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of weather DataFrame with 'HH:MM'/'H:MM' times normalized to JST ISO datetimes ('YYYY-MM-DDTHH:MM')."""
+    out = df.copy()
+    if out.empty or "time" not in out.columns or "open_day" not in out.columns:
+        return out
+
+    def _conv(row: pd.Series) -> Any:
+        t = row["time"]
+        d = row["open_day"]
+        if pd.isna(t) or pd.isna(d):
+            return t
+        t_str = str(t).strip()
+        if _HHMM_RE.match(t_str):
+            return normalize_jma_time(str(d).strip(), t_str)
+        return t
+
+    out["time"] = out.apply(_conv, axis=1)
+    return out
 
 
 class StorageError(RuntimeError):
@@ -67,8 +92,13 @@ class ParquetStorage:
                 self.unreadable_months.add(ym)
                 logger.error(f"Failed to read existing Parquet {target_path}; keeping file and stopping write: {e}")
                 raise StorageError(f"Cannot read existing Parquet {target_path}: {e}") from e
+            if kind == "weather":
+                df_existing = normalize_weather_frame(df_existing)
+                df_new = normalize_weather_frame(df_new)
             df_combined = pd.concat([df_existing, df_new], ignore_index=True)
         else:
+            if kind == "weather":
+                df_new = normalize_weather_frame(df_new)
             df_combined = df_new
 
         keys = KEYS_MAP.get(kind)

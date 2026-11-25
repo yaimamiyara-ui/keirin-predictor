@@ -5,7 +5,8 @@ import pytest
 import pandas as pd
 from unittest.mock import patch, MagicMock
 
-from keirin.storage import ParquetStorage, StorageError
+from keirin.storage import ParquetStorage, StorageError, normalize_weather_frame
+from keirin.scripts.migrate_weather_times import migrate_weather_dir, main as migrate_weather_main
 from keirin.fetch.http import PoliteClient, PoliteError, PoliteRateLimitError
 from keirin.fetch.client import ChariClient, ChariError, ChariRateLimitError
 from keirin.fetch.chariloto import parse_results_day, parse_vel_menu, parse_race_info, parse_odds
@@ -569,3 +570,103 @@ def test_edge_month_completion_and_select_backfill_month(tmp_path: pathlib.Path,
     assert sel4["status"] == "complete"
     assert sel4["done"] == "1"
     assert sel4["deferred"] == "0"
+
+
+def test_weather_time_unification_and_migration(tmp_path: pathlib.Path, monkeypatch):
+    # 1) Reader helper normalize_weather_frame: converts "00:10", "9:00", "24:00" (next day), leaves Open-Meteo ISO untouched
+    raw_df = pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "9:00", "source": "jma", "temp": 8.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:00", "source": "jma", "temp": 4.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T12:00", "source": "openmeteo", "temp": 11.0},
+    ])
+    norm_df = normalize_weather_frame(raw_df)
+    assert list(norm_df["time"]) == [
+        "2026-03-10T00:10",
+        "2026-03-10T09:00",
+        "2026-03-11T00:00",
+        "2026-03-10T12:00",
+    ]
+    # Original frame is not mutated
+    assert list(raw_df["time"]) == ["00:10", "9:00", "24:00", "2026-03-10T12:00"]
+
+    # 2) Storage migration on write: old-format month file merged with new ISO rows deduplicates to one row per observation, keeping newer row
+    data_dir = tmp_path / "storage_merge"
+    w_path = data_dir / "weather" / "2026" / "2026-03.parquet"
+    w_path.parent.mkdir(parents=True, exist_ok=True)
+
+    old_month_df = pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0, "wind_speed": 1.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:00", "source": "jma", "temp": 4.0, "wind_speed": 1.2},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T01:00", "source": "openmeteo", "temp": 6.0, "wind_speed": 2.0},
+    ])
+    old_month_df.to_parquet(w_path, index=False)
+
+    storage = ParquetStorage(data_dir=data_dir)
+    new_rows = [
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T00:10", "source": "jma", "temp": 5.5, "wind_speed": 1.5},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T00:20", "source": "jma", "temp": 5.6, "wind_speed": 1.6},
+    ]
+    storage.save("weather", "2026-03-10", new_rows)
+
+    merged_df = pd.read_parquet(w_path)
+    assert len(merged_df) == 4
+    assert set(merged_df["time"]) == {
+        "2026-03-10T00:10",
+        "2026-03-10T00:20",
+        "2026-03-11T00:00",
+        "2026-03-10T01:00",
+    }
+    row_0010 = merged_df[(merged_df["time"] == "2026-03-10T00:10") & (merged_df["source"] == "jma")].iloc[0]
+    assert row_0010["temp"] == 5.5
+    assert row_0010["wind_speed"] == 1.5
+
+    row_om = merged_df[merged_df["source"] == "openmeteo"].iloc[0]
+    assert row_om["time"] == "2026-03-10T01:00"
+    assert row_om["temp"] == 6.0
+
+    # 3) One-off migration script on a temp directory: dry-run changes nothing; real run converts & deduplicates and is idempotent
+    mig_dir = tmp_path / "mig_data"
+    mig_file = mig_dir / "weather" / "2026" / "2026-03.parquet"
+    mig_file.parent.mkdir(parents=True, exist_ok=True)
+
+    mixed_df = pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "9:00", "source": "jma", "temp": 8.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:00", "source": "jma", "temp": 4.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T00:10", "source": "jma", "temp": 5.9},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T03:00", "source": "openmeteo", "temp": 7.0},
+    ])
+    mixed_df.to_parquet(mig_file, index=False)
+    bytes_before = mig_file.read_bytes()
+
+    # Dry-run via CLI leaves file bytes untouched
+    monkeypatch.setattr("sys.argv", ["migrate_weather_times.py", str(mig_dir), "--dry-run"])
+    migrate_weather_main()
+    assert mig_file.read_bytes() == bytes_before
+
+    # Real run converts 3 HH:MM rows and removes 1 duplicate (keeping newer 5.9 row)
+    res1 = migrate_weather_dir(mig_dir, dry_run=False)
+    assert len(res1) == 1
+    assert res1[0]["rows_before"] == 5
+    assert res1[0]["rows_after"] == 4
+    assert res1[0]["converted"] == 3
+    assert res1[0]["duplicates_removed"] == 1
+
+    after_df = pd.read_parquet(mig_file)
+    assert len(after_df) == 4
+    assert list(after_df["time"]) == [
+        "2026-03-10T09:00",
+        "2026-03-11T00:00",
+        "2026-03-10T00:10",
+        "2026-03-10T03:00",
+    ]
+    assert after_df[after_df["time"] == "2026-03-10T00:10"].iloc[0]["temp"] == 5.9
+
+    # Second run is idempotent (0 converted, 0 duplicates removed)
+    res2 = migrate_weather_dir(mig_dir, dry_run=False)
+    assert res2[0]["rows_before"] == 4
+    assert res2[0]["rows_after"] == 4
+    assert res2[0]["converted"] == 0
+    assert res2[0]["duplicates_removed"] == 0
+    pd.testing.assert_frame_equal(pd.read_parquet(mig_file), after_df)
