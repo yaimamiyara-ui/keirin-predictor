@@ -1,7 +1,15 @@
+import logging
 import os
 import pathlib
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Set, Union
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+class StorageError(RuntimeError):
+    """Raised when an existing Parquet file cannot be read or written safely."""
+    pass
 
 KEYS_MAP: Dict[str, List[str]] = {
     "race": ["vel_code", "open_day", "race_num"],
@@ -21,6 +29,7 @@ class ParquetStorage:
 
     def __init__(self, data_dir: Union[str, pathlib.Path] = "data"):
         self.data_dir = pathlib.Path(data_dir)
+        self.unreadable_months: Set[str] = set()
 
     def _get_parquet_path(self, kind: str, open_day: str) -> pathlib.Path:
         year = open_day[:4]
@@ -43,15 +52,22 @@ class ParquetStorage:
         if df_new.empty:
             return
 
+        ym = open_day[:7]
+        if ym in self.unreadable_months:
+            logger.error(f"Refusing to write {kind} for {ym}: month has an unreadable Parquet file.")
+            raise StorageError(f"Month {ym} is locked due to an unreadable Parquet file")
+
         target_path = self._get_parquet_path(kind, open_day)
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         if target_path.exists():
             try:
                 df_existing = pd.read_parquet(target_path)
-                df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-            except Exception:
-                df_combined = df_new
+            except Exception as e:
+                self.unreadable_months.add(ym)
+                logger.error(f"Failed to read existing Parquet {target_path}; keeping file and stopping write: {e}")
+                raise StorageError(f"Cannot read existing Parquet {target_path}: {e}") from e
+            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
         else:
             df_combined = df_new
 
@@ -81,8 +97,11 @@ class ParquetStorage:
     new_done_count = 0
 
     def add_done(self, vel_code: str, open_day: str, kind: str) -> None:
-        # 月完了の印も「進んだ」に数える（次の月へ続けて進むため）
-        type(self).new_done_count += 1
+        ym = open_day[:7]
+        if ym in self.unreadable_months:
+            logger.error(f"Refusing to mark done for {vel_code} {open_day} {kind}: month {ym} has unreadable Parquet.")
+            return
+
         done_path = self._get_done_path(open_day)
         done_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -97,6 +116,9 @@ class ParquetStorage:
 
         if target_line in lines:
             return
+
+        # 月完了の印も「進んだ」に数える（次の月へ続けて進むため）
+        type(self).new_done_count += 1
 
         lines.add(target_line)
         sorted_lines = sorted(list(lines))

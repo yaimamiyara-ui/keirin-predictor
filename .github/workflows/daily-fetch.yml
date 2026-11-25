@@ -7,6 +7,9 @@ on:
     - cron: "40 3 * * *"
     - cron: "50 6 * * *"
   workflow_dispatch:
+# 遡り取得（backfill-auto）とは別のグループにする（同じグループだと、待機中の実行が
+# 新しい実行に置き換えられて日次取得が取り消されることがある）。同じ月を書かないよう、
+# 遡り取得の側が最近の月を避ける
 concurrency: { group: keirin-daily, cancel-in-progress: false }
 permissions: { contents: read }
 jobs:
@@ -26,12 +29,26 @@ jobs:
           echo "inc1=*/${Y:0:4}/${Y:0:7}.parquet" >> "$GITHUB_OUTPUT"; echo "inc2=*/${T:0:4}/${T:0:7}.parquet" >> "$GITHUB_OUTPUT"
           echo "dn1=_done/${Y:0:4}/${Y:0:7}.txt" >> "$GITHUB_OUTPUT"; echo "dn2=_done/${T:0:4}/${T:0:7}.txt" >> "$GITHUB_OUTPUT"
       - name: その月のデータをDriveから取得
-        run: rclone copy gdrive:keirin-predictor/data data --include "${{ steps.d.outputs.inc1 }}" --include "${{ steps.d.outputs.inc2 }}" --include "${{ steps.d.outputs.dn1 }}" --include "${{ steps.d.outputs.dn2 }}" || true
+        id: pull
+        run: |
+          rclone copy gdrive:keirin-predictor/data data \
+            --include "${{ steps.d.outputs.inc1 }}" --include "${{ steps.d.outputs.inc2 }}" \
+            --include "${{ steps.d.outputs.dn1 }}" --include "${{ steps.d.outputs.dn2 }}"
+          rclone check gdrive:keirin-predictor/data data --one-way \
+            --include "${{ steps.d.outputs.inc1 }}" --include "${{ steps.d.outputs.inc2 }}" \
+            --include "${{ steps.d.outputs.dn1 }}" --include "${{ steps.d.outputs.dn2 }}"
       - name: 前日分（確定）
-        run: python -m keirin.scripts.collect --start "${{ steps.d.outputs.y }}" --end "${{ steps.d.outputs.y }}" --max-minutes 80
+        if: steps.pull.outcome == 'success'
+        run: python -m keirin.scripts.collect --start "${{ steps.d.outputs.y }}" --end "${{ steps.d.outputs.y }}" --max-minutes 75
       - name: 当日分（出走表・並び予想・朝のオッズ）
-        if: always()
-        run: python -m keirin.scripts.collect --start "${{ steps.d.outputs.t }}" --end "${{ steps.d.outputs.t }}" --today-mode --max-minutes 50
+        if: always() && steps.pull.outcome == 'success'
+        run: python -m keirin.scripts.collect --start "${{ steps.d.outputs.t }}" --end "${{ steps.d.outputs.t }}" --today-mode --max-minutes 45
       - name: Driveへ保存
-        if: always()
-        run: '[ -d data ] && rclone copy data gdrive:keirin-predictor/data || true'
+        if: always() && steps.pull.outcome == 'success'
+        run: |
+          if [ -d data ]; then
+            rclone copy data gdrive:keirin-predictor/data --exclude "_done/**"
+            rclone check data gdrive:keirin-predictor/data --one-way --exclude "_done/**"
+            rclone copy data gdrive:keirin-predictor/data --include "_done/**"
+            rclone check data gdrive:keirin-predictor/data --one-way --include "_done/**"
+          fi

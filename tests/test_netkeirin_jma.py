@@ -1,7 +1,7 @@
 from pathlib import Path
 import pytest
 from keirin.fetch.netkeirin import parse_nk_entry, parse_nk_comments
-from keirin.fetch.jma import parse_jma_10min, parse_jma_stations, parse_jma_prec_list
+from keirin.fetch.jma import parse_jma_10min, parse_jma_stations, parse_jma_prec_list, normalize_jma_time
 from keirin.fetch.openmeteo import parse_openmeteo
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -80,6 +80,10 @@ def test_jma_10min_parsing():
     else:
         assert first_row["wind_speed"] == 1.5
         assert first_row["wind_dir"] == "北"
+
+    assert normalize_jma_time("2026-03-10", "00:10") == "2026-03-10T00:10"
+    assert normalize_jma_time("2026-03-10", "9:00") == "2026-03-10T09:00"
+    assert normalize_jma_time("2026-03-10", "24:00") == "2026-03-11T00:00"
 
 
 def test_jma_prec_and_stations():
