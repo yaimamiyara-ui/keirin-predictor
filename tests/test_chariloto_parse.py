@@ -18,22 +18,15 @@ from keirin.common.schema import (
     ResultRow, PayoutRow, VenueInfoRow, CalendarRow, AthleteProfileRow
 )
 
-FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SYNTHETIC_FIXTURES_DIR = Path(__file__).parent / "fixtures_synthetic"
 
 
-def is_using_real_fixture(filename: str) -> bool:
-    return (FIXTURES_DIR / filename).exists()
-
-
 def read_fixture(filename: str) -> str:
-    path = FIXTURES_DIR / filename
-    if path.exists():
-        return path.read_text(encoding="utf-8")
-    synthetic_path = SYNTHETIC_FIXTURES_DIR / f"synthetic_{filename}"
-    if synthetic_path.exists():
-        return synthetic_path.read_text(encoding="utf-8")
-    pytest.skip(f"Fixture file {filename} does not exist at {path} or {synthetic_path}")
+    # 公開リポジトリでは、取得元のページの写しを置かない。同梱の合成データだけで確かめる
+    path = SYNTHETIC_FIXTURES_DIR / f"synthetic_{filename}"
+    if not path.exists():
+        pytest.fail(f"Synthetic fixture missing: {path}")
+    return path.read_text(encoding="utf-8")
 
 
 def test_parse_venue_year_days():
@@ -49,7 +42,6 @@ def test_parse_venue_year_days():
 
 def test_parse_calendar():
     filename = "calendar_2026_11.html"
-    real = is_using_real_fixture(filename)
     html = read_fixture(filename)
     items = parse_calendar(html, year=2026, month=11)
     assert isinstance(items, list)
@@ -60,27 +52,25 @@ def test_parse_calendar():
 
     aomori = [x for x in items if x["venue_name"] == "青森" and x["day"] == 3]
     assert len(aomori) == 1
-    expected_grade = "F1" if real else "F2"
+    expected_grade = "F2"
     assert aomori[0]["grade"] == expected_grade
 
 
 def test_parse_vel_menu():
     filename = "vel_menu_2026-11-17_46.json"
-    real = is_using_real_fixture(filename)
     raw_json = read_fixture(filename)
     data = json.loads(raw_json)
     meeting, races = parse_vel_menu(data)
 
     assert meeting["vel_name"] == "富山"
     assert meeting["open_day"] == "2026-11-17"
-    expected_race_count = 12 if real else 3
+    expected_race_count = 3
     assert len(races) == expected_race_count
     assert races[0]["race_num"] == 1
 
 
 def test_parse_race_info():
     filename = "race_info_2026-03-10_13_1.json"
-    real = is_using_real_fixture(filename)
     raw_json = read_fixture(filename)
     data = json.loads(raw_json)
     race, entries, prediction = parse_race_info(data)
@@ -96,16 +86,10 @@ def test_parse_race_info():
     assert len(entry_rows) == 7
 
     car7 = next(e for e in entry_rows if e.entry_num == 7)
-    if real:
-        # 7番 山崎航 の検証
-        assert car7.name == "山崎航"
-        assert car7.average_point == pytest.approx(88.458, rel=1e-2)
-        assert car7.average_win_raw == 250
-    else:
-        assert car7.name == "テスト選手G"
-        assert car7.player_id == 9007
-        assert car7.average_point == pytest.approx(85.5, rel=1e-2)
-        assert car7.average_win_raw == 300
+    assert car7.name == "テスト選手G"
+    assert car7.player_id == 9007
+    assert car7.average_point == pytest.approx(85.5, rel=1e-2)
+    assert car7.average_win_raw == 300
     assert car7.history is not None
 
     pred_row = PredictionRow(**prediction)
@@ -115,7 +99,6 @@ def test_parse_race_info():
 
 def test_parse_odds_final():
     filename = "odds_final_2016-01-03_13_1.json"
-    real = is_using_real_fixture(filename)
     raw_json = read_fixture(filename)
     data = json.loads(raw_json)
     odds_list = parse_odds(data, snapshot_label="final")
@@ -124,17 +107,12 @@ def test_parse_odds_final():
     assert len(odds_rows) > 0
 
     wide_12 = next(o for o in odds_rows if o.bet_type == "wide" and o.combo == "1-2")
-    if real:
-        assert wide_12.odds_min == 3.8
-        assert wide_12.odds_max == 4.5
-    else:
-        assert wide_12.odds_min == 2.5
-        assert wide_12.odds_max == 3.1
+    assert wide_12.odds_min == 2.5
+    assert wide_12.odds_max == 3.1
 
 
 def test_parse_odds_live():
     filename = "odds_live_2026-11-17_46_12.json"
-    real = is_using_real_fixture(filename)
     raw_json = read_fixture(filename)
     data = json.loads(raw_json)
     odds_list = parse_odds(data, snapshot_label="live")
@@ -143,12 +121,8 @@ def test_parse_odds_live():
     assert len(odds_rows) > 0
 
     wide_12 = next(o for o in odds_rows if o.bet_type == "wide" and o.combo == "1-2")
-    if real:
-        assert wide_12.odds_min == 3.9
-        assert wide_12.odds_max == 4.3
-    else:
-        assert wide_12.odds_min == 2.8
-        assert wide_12.odds_max == 3.4
+    assert wide_12.odds_min == 2.8
+    assert wide_12.odds_max == 3.4
 
 
 def test_parse_lineup():
@@ -163,7 +137,6 @@ def test_parse_lineup():
 
 def test_parse_results_day():
     filename = "results_day_13_2026-03-10.html"
-    real = is_using_real_fixture(filename)
     html = read_fixture(filename)
     results, payouts, lineups = parse_results_day(html, vel="13", date="2026-03-10")
 
@@ -180,62 +153,35 @@ def test_parse_results_day():
     wide_37 = next(p for p in pay_rows if p.race_num == 1 and p.bet_type == "wide" and p.combo == "3=7")
     l1 = next(l for l in line_rows if l.race_num == 1)
 
-    if real:
-        # 1R 1着 山崎航 捲くり
-        assert r1_1st.car_num == 7
-        assert r1_1st.name == "山崎航"
-        assert r1_1st.factor == "捲くり"
-        # 3連単 7-3-4 16,790円
-        assert sanrentan.payout_yen == 16790
-        # ワイド 3=7 1,500円
-        assert wide_37.payout_yen == 1500
-        # 周回予想 7-1-5-6/2-4/3
-        assert l1.lineup == "7-1-5-6/2-4/3"
-    else:
-        assert r1_1st.car_num == 7
-        assert r1_1st.name == "テスト選手G"
-        assert r1_1st.factor == "逃げ"
-        assert sanrentan.payout_yen == 12340
-        assert wide_37.payout_yen == 560
-        assert l1.lineup == "7-1/2-4/3-5-6"
+    assert r1_1st.car_num == 7
+    assert r1_1st.name == "テスト選手G"
+    assert r1_1st.factor == "逃げ"
+    assert sanrentan.payout_yen == 12340
+    assert wide_37.payout_yen == 560
+    assert l1.lineup == "7-1/2-4/3-5-6"
 
 
 def test_parse_velinfo():
     filename = "velinfo_46.html"
-    real = is_using_real_fixture(filename)
     html = read_fixture(filename)
     info = parse_velinfo(html, vel="46")
 
     row = VenueInfoRow(**info)
-    if real:
-        assert row.bank_length_m == 333
-        assert row.straight_m == 43.0
-        assert row.strike_first_nige == 27
-        assert row.strike_first_makuri == 35
-        assert row.strike_first_sashi == 38
-    else:
-        assert row.bank_length_m == 400
-        assert row.straight_m == 50.0
-        assert row.strike_first_nige == 25
-        assert row.strike_first_makuri == 30
-        assert row.strike_first_sashi == 45
+    assert row.bank_length_m == 400
+    assert row.straight_m == 50.0
+    assert row.strike_first_nige == 25
+    assert row.strike_first_makuri == 30
+    assert row.strike_first_sashi == 45
 
 
 def test_parse_athlete_profile():
-    filename = "athlete_profile_15287.html"
-    real = is_using_real_fixture(filename)
+    filename = "athlete_profile_9001.html"
     html = read_fixture(filename)
     profile = parse_athlete_profile(html)
 
     row = AthleteProfileRow(**profile)
-    if real:
-        assert row.registration_num == "015287" or row.registration_num == "15287"
-        assert row.height_cm == 170
-        assert row.weight_kg == 74
-        assert row.home_bank == "高知"
-    else:
-        assert row.player_id == 9001
-        assert row.registration_num == "009001"
-        assert row.height_cm == 175
-        assert row.weight_kg == 78
-        assert row.home_bank == "テスト場"
+    assert row.player_id == 9001
+    assert row.registration_num == "009001"
+    assert row.height_cm == 175
+    assert row.weight_kg == 78
+    assert row.home_bank == "テスト場"
