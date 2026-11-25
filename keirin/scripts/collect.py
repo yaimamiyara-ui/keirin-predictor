@@ -742,7 +742,7 @@ def main() -> None:
                         storage.add_done(vel_code, open_day, "netkeirin")
                     else:
                         if not menu_races:
-                            raise ValueError(f"Empty vel_menu races for Netkeirin on scheduled day {vel_code} {open_day}")
+                            raise DayLevelGap("empty vel_menu races")
 
                         expected_r_nums = [r["race_num"] for r in menu_races if not _is_race_cancelled(r)]
                         if not expected_r_nums:
@@ -881,6 +881,23 @@ def main() -> None:
                     logger.warning(f"Netkeirin rate-limited for {vel_code} {open_day}: {e}; skipping netkeirin until next run")
                     skipped_sources.add("netkeirin")
                     any_failure = True
+                except DayLevelGap as e:
+                    # 正常に応答したのにメニューからレースを読めない日は、日単位で数えて上限で閉じる
+                    rec = storage.record_race_failure(
+                        vel_code, open_day, "netkeirin", "day", str(e), max_retries=args.max_retries,
+                    )
+                    if rec["status"] == "unavailable":
+                        logger.warning(
+                            f"Closing Netkeirin {vel_code} {open_day} with a day-level gap after "
+                            f"{rec['attempts']} attempts: {rec['reason']}"
+                        )
+                        storage.add_done(vel_code, open_day, "netkeirin", detail=f"known_gaps=day:{rec['reason']}")
+                    else:
+                        logger.warning(
+                            f"Netkeirin day incomplete (attempt {rec['attempts']}/{args.max_retries}): "
+                            f"{vel_code} {open_day} ({rec['reason']})"
+                        )
+                        any_failure = True
                 except Exception as e:
                     # netkeirin は補助の取得元。一時的に失敗しても主力（チャリロト）を止めない。
                     # 取得済みにしないので次の実行でやり直す（Claude修正、2026-11-20）
