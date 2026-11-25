@@ -578,6 +578,46 @@ def test_edge_month_completion_and_select_backfill_month(tmp_path: pathlib.Path,
     assert sel4["deferred"] == "0"
 
 
+def test_jma_time_range_and_migration_scope(tmp_path: pathlib.Path):
+    from keirin.fetch.jma import normalize_jma_time
+    from keirin.scripts.migrate_weather_times import migrate_weather_dir
+
+    assert normalize_jma_time("2026-03-10", "23:59") == "2026-03-10T23:59"
+    assert normalize_jma_time("2026-03-31", "24:00") == "2026-04-01T00:00"
+    for bad in ("24:10", "12:99", "25:00", "1:5", "ab:cd"):
+        assert normalize_jma_time("2026-03-10", bad) == bad
+
+    # a data root without weather/ is left alone, including non-weather Parquet files
+    data_dir = tmp_path / "data"
+    race_path = data_dir / "race" / "2026" / "2026-03.parquet"
+    race_path.parent.mkdir(parents=True)
+    race_df = pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "race_num": 1, "time": "10:00"},
+        {"vel_code": "13", "open_day": "2026-03-10", "race_num": 2, "time": "10:30"},
+    ])
+    race_df.to_parquet(race_path, index=False)
+    before = race_path.read_bytes()
+    assert migrate_weather_dir(data_dir) == []
+    assert race_path.read_bytes() == before
+
+    # a non-weather file inside weather/ is skipped; a file with an invalid time is refused and unchanged
+    w_dir = data_dir / "weather" / "2026"
+    w_dir.mkdir(parents=True)
+    other = w_dir / "other.parquet"
+    race_df.to_parquet(other, index=False)
+    other_before = other.read_bytes()
+    bad = w_dir / "2026-03.parquet"
+    pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:10", "source": "jma", "temp": 4.0},
+    ]).to_parquet(bad, index=False)
+    bad_before = bad.read_bytes()
+    results = migrate_weather_dir(data_dir)
+    assert {r.get("skipped") for r in results} == {"not_weather", "invalid_times"}
+    assert other.read_bytes() == other_before
+    assert bad.read_bytes() == bad_before
+
+
 def test_weather_time_unification_and_migration(tmp_path: pathlib.Path, monkeypatch):
     # 1) Reader helper normalize_weather_frame: converts "00:10", "9:00", "24:00" (next day), leaves Open-Meteo ISO untouched
     raw_df = pd.DataFrame([

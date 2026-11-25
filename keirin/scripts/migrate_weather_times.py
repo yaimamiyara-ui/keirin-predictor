@@ -16,6 +16,11 @@ def migrate_weather_file(path: pathlib.Path, dry_run: bool = False) -> Dict[str,
     df = pd.read_parquet(path)
     rows_before = len(df)
 
+    missing_keys = [k for k in KEYS_MAP["weather"] if k not in df.columns]
+    if missing_keys:
+        print(f"{path}: skipped (not a weather file; missing keys {missing_keys})")
+        return {"path": str(path), "skipped": "not_weather", "rows_before": rows_before}
+
     if "time" in df.columns and "open_day" in df.columns and not df.empty:
         converted = int(
             df.apply(lambda r: _is_hhmm_time(r["time"]) and not pd.isna(r["open_day"]), axis=1).sum()
@@ -25,11 +30,13 @@ def migrate_weather_file(path: pathlib.Path, dry_run: bool = False) -> Dict[str,
 
     df_norm = normalize_weather_frame(df)
 
-    keys = [k for k in KEYS_MAP["weather"] if k in df_norm.columns]
-    if keys:
-        df_dedup = df_norm.drop_duplicates(subset=keys, keep="last").reset_index(drop=True)
-    else:
-        df_dedup = df_norm
+    # 変換後も "HH:MM" のまま残った行は範囲外の時刻。ファイルを置き換えずに報告する
+    invalid = int(df_norm.apply(lambda r: _is_hhmm_time(r["time"]), axis=1).sum()) if not df_norm.empty else 0
+    if invalid:
+        print(f"{path}: refused (invalid_times={invalid}); file left unchanged")
+        return {"path": str(path), "skipped": "invalid_times", "invalid_times": invalid, "rows_before": rows_before}
+
+    df_dedup = df_norm.drop_duplicates(subset=list(KEYS_MAP["weather"]), keep="last").reset_index(drop=True)
 
     rows_after = len(df_dedup)
     duplicates_removed = rows_before - rows_after
@@ -56,7 +63,14 @@ def migrate_weather_file(path: pathlib.Path, dry_run: bool = False) -> Dict[str,
 
 def migrate_weather_dir(data_dir: Union[str, pathlib.Path], dry_run: bool = False) -> List[Dict[str, Any]]:
     base = pathlib.Path(data_dir)
-    weather_root = base / "weather" if (base / "weather").is_dir() else base
+    if (base / "weather").is_dir():
+        weather_root = base / "weather"
+    elif base.name == "weather" and base.is_dir():
+        weather_root = base
+    else:
+        # 気象のフォルダが無いところでは何もしない（レースや結果のファイルを触らない）
+        print(f"{base}: no weather directory; nothing to migrate")
+        return []
     files = sorted(weather_root.rglob("*.parquet"))
     results = []
     for p in files:
