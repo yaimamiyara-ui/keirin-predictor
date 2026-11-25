@@ -1,0 +1,51 @@
+name: migrate-weather
+# 気象データの時刻を「HH:MM」から「YYYY-MM-DDTHH:MM」に直す（手動で動かすだけ。定時実行はしない）。
+# まず dry_run=true で件数だけ確かめ、問題がなければ dry_run=false で書き換える。
+# 書き換える前に、Drive 上の気象フォルダをまるごと backup/ に写しておく。
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true なら確かめるだけで書き換えない"
+        type: boolean
+        default: true
+# 遡り取得と同じグループにして、同時に同じファイルを書かないようにする
+concurrency: { group: keirin-fetch, cancel-in-progress: false }
+permissions: { contents: read }
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env: { PYTHONPATH: "${{ github.workspace }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { rclone_config: "${{ secrets.RCLONE_CONFIG }}" }
+      - name: 気象データをDriveから取得
+        run: |
+          rclone copy gdrive:keirin-predictor/data/weather data/weather
+          rclone check gdrive:keirin-predictor/data/weather data/weather --one-way
+          find data/weather -name "*.parquet" | wc -l
+      - name: 書き換える前にDrive上で控えを取る
+        if: ${{ !inputs.dry_run }}
+        run: |
+          B="gdrive:keirin-predictor/backup/weather-$(TZ=Asia/Tokyo date +%Y%m%d-%H%M)-${{ github.run_id }}"
+          rclone copy gdrive:keirin-predictor/data/weather "$B"
+          rclone check gdrive:keirin-predictor/data/weather "$B" --one-way
+          echo "控え: $B"
+      - name: 時刻を直す
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python -m keirin.scripts.migrate_weather_times data --dry-run | tee migrate.log
+          else
+            python -m keirin.scripts.migrate_weather_times data | tee migrate.log
+          fi
+          echo "---- まとめ ----"
+          echo "ファイル数: $(grep -c 'before=' migrate.log || true)"
+          echo "書き換えを断ったファイル: $(grep -c 'refused' migrate.log || true)"
+          grep 'refused' migrate.log || true
+      - name: Driveへ保存
+        if: ${{ !inputs.dry_run }}
+        run: |
+          rclone copy data/weather gdrive:keirin-predictor/data/weather
+          rclone check data/weather gdrive:keirin-predictor/data/weather --one-way
