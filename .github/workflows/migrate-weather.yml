@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 60
     env: { PYTHONPATH: "${{ github.workspace }}" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
         with: { rclone_config: "${{ secrets.RCLONE_CONFIG }}" }
       - name: 気象データをDriveから取得

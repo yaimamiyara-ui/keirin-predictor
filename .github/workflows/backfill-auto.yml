@@ -17,7 +17,7 @@ jobs:
       should_dispatch: ${{ steps.check_progress.outputs.should_dispatch }}
     env: { PYTHONPATH: "${{ github.workspace }}" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
         with: { rclone_config: "${{ secrets.RCLONE_CONFIG }}" }
       - name: 取得済みの記録をDriveから取得
@@ -80,7 +80,7 @@ jobs:
     timeout-minutes: 5
     permissions: { contents: read, actions: write }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: 続きがあれば自分をもう一度起動（GitHubの定時実行が抜けることがあるため）
         env: { GH_TOKEN: "${{ github.token }}" }
         run: gh workflow run backfill-auto.yml --ref main
