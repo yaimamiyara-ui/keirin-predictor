@@ -18,17 +18,17 @@ def normalize_jma_time(date_str: str, time_str: str) -> str:
         return s
     if "T" in s:
         return s
+    # 範囲外（24:10、12:99 など）や形の違う値は変換せずそのまま返す（正常な観測と同じキーにしない）
     parts = s.split(":")
-    if len(parts) != 2:
-        return f"{date_str}T{s}"
-    try:
-        hour = int(parts[0])
-        minute = int(parts[1])
-    except ValueError:
-        return f"{date_str}T{s}"
-    if hour == 24:
+    if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()) or len(parts[1]) != 2:
+        return s
+    hour = int(parts[0])
+    minute = int(parts[1])
+    if hour == 24 and minute == 0:
         next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-        return f"{next_day}T00:{minute:02d}"
+        return f"{next_day}T00:00"
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return s
     return f"{date_str}T{hour:02d}:{minute:02d}"
 
 
@@ -167,7 +167,7 @@ def parse_jma_10min(html: str, kind: str, date_str: str) -> List[Dict[str, Any]]
             gust_dir = g_dir_raw if g_dir_raw and g_dir_raw != "--" else None
 
         results.append({
-            "time": time_str,  # 保存形式は従来どおり（JST の日時への統一は既存データの移行と合わせて別に行う）
+            "time": normalize_jma_time(date_str, time_str),
             "wind_speed": wind_speed,
             "wind_dir": wind_dir,
             "gust_speed": gust_speed,

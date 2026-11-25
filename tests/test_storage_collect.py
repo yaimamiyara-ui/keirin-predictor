@@ -5,7 +5,8 @@ import pytest
 import pandas as pd
 from unittest.mock import patch, MagicMock
 
-from keirin.storage import ParquetStorage, StorageError
+from keirin.storage import ParquetStorage, StorageError, normalize_weather_frame
+from keirin.scripts.migrate_weather_times import migrate_weather_dir, main as migrate_weather_main
 from keirin.fetch.http import PoliteClient, PoliteError, PoliteRateLimitError
 from keirin.fetch.client import ChariClient, ChariError, ChariRateLimitError
 from keirin.fetch.chariloto import parse_results_day, parse_vel_menu, parse_race_info, parse_odds
@@ -577,6 +578,145 @@ def test_edge_month_completion_and_select_backfill_month(tmp_path: pathlib.Path,
     assert sel4["deferred"] == "0"
 
 
+def test_jma_time_range_and_migration_scope(tmp_path: pathlib.Path):
+    from keirin.fetch.jma import normalize_jma_time
+    from keirin.scripts.migrate_weather_times import migrate_weather_dir
+
+    assert normalize_jma_time("2026-03-10", "23:59") == "2026-03-10T23:59"
+    assert normalize_jma_time("2026-03-31", "24:00") == "2026-04-01T00:00"
+    for bad in ("24:10", "12:99", "25:00", "1:5", "ab:cd"):
+        assert normalize_jma_time("2026-03-10", bad) == bad
+
+    # a data root without weather/ is left alone, including non-weather Parquet files
+    data_dir = tmp_path / "data"
+    race_path = data_dir / "race" / "2026" / "2026-03.parquet"
+    race_path.parent.mkdir(parents=True)
+    race_df = pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "race_num": 1, "time": "10:00"},
+        {"vel_code": "13", "open_day": "2026-03-10", "race_num": 2, "time": "10:30"},
+    ])
+    race_df.to_parquet(race_path, index=False)
+    before = race_path.read_bytes()
+    assert migrate_weather_dir(data_dir) == []
+    assert race_path.read_bytes() == before
+
+    # a non-weather file inside weather/ is skipped; a file with an invalid time is refused and unchanged
+    w_dir = data_dir / "weather" / "2026"
+    w_dir.mkdir(parents=True)
+    other = w_dir / "other.parquet"
+    race_df.to_parquet(other, index=False)
+    other_before = other.read_bytes()
+    bad = w_dir / "2026-03.parquet"
+    pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:10", "source": "jma", "temp": 4.0},
+    ]).to_parquet(bad, index=False)
+    bad_before = bad.read_bytes()
+    results = migrate_weather_dir(data_dir)
+    assert {r.get("skipped") for r in results} == {"not_weather", "invalid_times"}
+    assert other.read_bytes() == other_before
+    assert bad.read_bytes() == bad_before
+
+
+def test_weather_time_unification_and_migration(tmp_path: pathlib.Path, monkeypatch):
+    # 1) Reader helper normalize_weather_frame: converts "00:10", "9:00", "24:00" (next day), leaves Open-Meteo ISO untouched
+    raw_df = pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "9:00", "source": "jma", "temp": 8.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:00", "source": "jma", "temp": 4.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T12:00", "source": "openmeteo", "temp": 11.0},
+    ])
+    norm_df = normalize_weather_frame(raw_df)
+    assert list(norm_df["time"]) == [
+        "2026-03-10T00:10",
+        "2026-03-10T09:00",
+        "2026-03-11T00:00",
+        "2026-03-10T12:00",
+    ]
+    # Original frame is not mutated
+    assert list(raw_df["time"]) == ["00:10", "9:00", "24:00", "2026-03-10T12:00"]
+
+    # 2) Storage migration on write: old-format month file merged with new ISO rows deduplicates to one row per observation, keeping newer row
+    data_dir = tmp_path / "storage_merge"
+    w_path = data_dir / "weather" / "2026" / "2026-03.parquet"
+    w_path.parent.mkdir(parents=True, exist_ok=True)
+
+    old_month_df = pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0, "wind_speed": 1.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:00", "source": "jma", "temp": 4.0, "wind_speed": 1.2},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T01:00", "source": "openmeteo", "temp": 6.0, "wind_speed": 2.0},
+    ])
+    old_month_df.to_parquet(w_path, index=False)
+
+    storage = ParquetStorage(data_dir=data_dir)
+    new_rows = [
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T00:10", "source": "jma", "temp": 5.5, "wind_speed": 1.5},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T00:20", "source": "jma", "temp": 5.6, "wind_speed": 1.6},
+    ]
+    storage.save("weather", "2026-03-10", new_rows)
+
+    merged_df = pd.read_parquet(w_path)
+    assert len(merged_df) == 4
+    assert set(merged_df["time"]) == {
+        "2026-03-10T00:10",
+        "2026-03-10T00:20",
+        "2026-03-11T00:00",
+        "2026-03-10T01:00",
+    }
+    row_0010 = merged_df[(merged_df["time"] == "2026-03-10T00:10") & (merged_df["source"] == "jma")].iloc[0]
+    assert row_0010["temp"] == 5.5
+    assert row_0010["wind_speed"] == 1.5
+
+    row_om = merged_df[merged_df["source"] == "openmeteo"].iloc[0]
+    assert row_om["time"] == "2026-03-10T01:00"
+    assert row_om["temp"] == 6.0
+
+    # 3) One-off migration script on a temp directory: dry-run changes nothing; real run converts & deduplicates and is idempotent
+    mig_dir = tmp_path / "mig_data"
+    mig_file = mig_dir / "weather" / "2026" / "2026-03.parquet"
+    mig_file.parent.mkdir(parents=True, exist_ok=True)
+
+    mixed_df = pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "9:00", "source": "jma", "temp": 8.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:00", "source": "jma", "temp": 4.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T00:10", "source": "jma", "temp": 5.9},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T03:00", "source": "openmeteo", "temp": 7.0},
+    ])
+    mixed_df.to_parquet(mig_file, index=False)
+    bytes_before = mig_file.read_bytes()
+
+    # Dry-run via CLI leaves file bytes untouched
+    monkeypatch.setattr("sys.argv", ["migrate_weather_times.py", str(mig_dir), "--dry-run"])
+    migrate_weather_main()
+    assert mig_file.read_bytes() == bytes_before
+
+    # Real run converts 3 HH:MM rows and removes 1 duplicate (keeping newer 5.9 row)
+    res1 = migrate_weather_dir(mig_dir, dry_run=False)
+    assert len(res1) == 1
+    assert res1[0]["rows_before"] == 5
+    assert res1[0]["rows_after"] == 4
+    assert res1[0]["converted"] == 3
+    assert res1[0]["duplicates_removed"] == 1
+
+    after_df = pd.read_parquet(mig_file)
+    assert len(after_df) == 4
+    assert list(after_df["time"]) == [
+        "2026-03-10T09:00",
+        "2026-03-11T00:00",
+        "2026-03-10T00:10",
+        "2026-03-10T03:00",
+    ]
+    assert after_df[after_df["time"] == "2026-03-10T00:10"].iloc[0]["temp"] == 5.9
+
+    # Second run is idempotent (0 converted, 0 duplicates removed)
+    res2 = migrate_weather_dir(mig_dir, dry_run=False)
+    assert res2[0]["rows_before"] == 4
+    assert res2[0]["rows_after"] == 4
+    assert res2[0]["converted"] == 0
+    assert res2[0]["duplicates_removed"] == 0
+    pd.testing.assert_frame_equal(pd.read_parquet(mig_file), after_df)
+
 def test_2race_empty_final_odds_partial_save_retry_limit_and_next_month(tmp_path: pathlib.Path, monkeypatch):
     """
     Tests High 1 & High 2:
@@ -898,6 +1038,46 @@ def test_whole_day_gap_respects_retry_limit_and_closes_day(tmp_path: pathlib.Pat
     assert gaps and all(g["status"] == "unavailable" for g in gaps)
 
 
+def test_invalid_weather_times_are_never_written(tmp_path: pathlib.Path):
+    from keirin.scripts.migrate_weather_times import migrate_weather_dir
+    from keirin.storage import is_valid_weather_time
+
+    assert is_valid_weather_time("2026-03-10T23:59")
+    for bad in ("9:0", "2026-03-10T12:99", "2026-03-10T24:00", "2026-02-30T10:00", "24:10", "", None):
+        assert not is_valid_weather_time(bad)
+
+    # migration: one bad value mixed with good old-format rows -> file left unchanged
+    w_dir = tmp_path / "data" / "weather" / "2026"
+    w_dir.mkdir(parents=True)
+    f = w_dir / "2026-03.parquet"
+    pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "9:0", "source": "jma", "temp": 6.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T12:99", "source": "openmeteo", "temp": 7.0},
+    ]).to_parquet(f, index=False)
+    before = f.read_bytes()
+    res = migrate_weather_dir(tmp_path / "data")
+    assert res[0]["skipped"] == "invalid_times" and res[0]["invalid_times"] == 2
+    assert f.read_bytes() == before
+
+    # normal save: an existing file with an invalid time is not rewritten
+    st = ParquetStorage(data_dir=tmp_path / "data")
+    new_rows = [{"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T01:00", "source": "openmeteo", "temp": 3.0}]
+    with pytest.raises(StorageError):
+        st.save("weather", "2026-03-10", new_rows)
+    assert f.read_bytes() == before
+
+    # normal save: invalid new rows are dropped, valid ones are kept
+    st2 = ParquetStorage(data_dir=tmp_path / "data2")
+    st2.save("weather", "2026-03-10", [
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:10", "source": "jma", "temp": 1.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T12:99", "source": "openmeteo", "temp": 2.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:20", "source": "jma", "temp": 3.0},
+    ])
+    saved = pd.read_parquet(tmp_path / "data2" / "weather" / "2026" / "2026-03.parquet")
+    assert list(saved["time"]) == ["2026-03-10T00:20"]
+
+
 def test_empty_menu_with_all_sources_closes_day_and_advances_month(tmp_path: pathlib.Path, monkeypatch):
     """A permanently empty menu is counted per day for chariloto AND netkeirin, so the month completes and backfill moves on."""
     venues_config = {"13": {"vel_code": "13", "name": "テスト場", "is_indoor": True}}
@@ -942,3 +1122,43 @@ def test_empty_menu_with_all_sources_closes_day_and_advances_month(tmp_path: pat
     assert sel["status"] == "selected" and sel["ym"] == "2026-04"
     sources = {g["source"] for g in st.get_month_gaps("2026-03")}
     assert sources == {"chariloto", "netkeirin"}
+
+
+@pytest.mark.parametrize("om_valid", [True, False])
+def test_weather_day_without_valid_times_falls_back_and_is_not_marked_done(tmp_path: pathlib.Path, monkeypatch, om_valid):
+    """JMA rows that all have invalid times fall back to Open-Meteo; with no valid row at all the day is not done."""
+    venues_config = {"13": {"vel_code": "13", "name": "テスト場", "is_indoor": False,
+                            "jma": {"prec_no": "1", "block_no": "1"}, "lat": 35.0, "lon": 139.0}}
+    monkeypatch.setattr(collect_module, "fetch_calendar",
+                        lambda client, yr, mo: [{"venue_name": "テスト場", "day": 10, "grade": "F2", "flags": []}])
+    monkeypatch.setattr(collect_module, "fetch_venue_year_days", lambda client, vel, yr: ["2026-03-10"])
+    monkeypatch.setattr(collect_module, "fetch_jma_10min", lambda client, station, day: [
+        {"time": "24:10", "wind_speed": 1.0}, {"time": "12:99", "wind_speed": 2.0}])
+    om_calls = []
+
+    def om(client, lat, lon, start, end):
+        om_calls.append(start)
+        t = "2026-03-10T12:00" if om_valid else "2026-03-10T25:00"
+        return [{"time": t, "temperature": 10.0}]
+
+    monkeypatch.setattr(collect_module, "fetch_openmeteo_hourly", om)
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr("sys.argv", ["collect.py", "--start", "2026-03-01", "--end", "2026-03-31", "--venues", "13",
+                                     "--data-dir", str(data_dir), "--sources", "weather"])
+    with patch("keirin.scripts.collect.load_venues_config", return_value=venues_config):
+        try:
+            collect_module.main()
+        except SystemExit:
+            pass
+
+    st = ParquetStorage(data_dir=data_dir)
+    assert om_calls == ["2026-03-10"]
+    w_path = data_dir / "weather" / "2026" / "2026-03.parquet"
+    if om_valid:
+        assert st.is_done("13", "2026-03-10", "weather")
+        saved = pd.read_parquet(w_path)
+        assert list(saved["time"]) == ["2026-03-10T12:00"] and list(saved["source"]) == ["openmeteo"]
+    else:
+        assert not st.is_done("13", "2026-03-10", "weather")
+        assert not w_path.exists()

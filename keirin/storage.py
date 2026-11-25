@@ -2,10 +2,59 @@ import json
 import logging
 import os
 import pathlib
+import re
 from typing import Any, Dict, List, Optional, Set, Union
 import pandas as pd
 
+from keirin.fetch.jma import normalize_jma_time
+
 logger = logging.getLogger(__name__)
+
+_HHMM_RE = re.compile(r"^\d{1,2}:\d{2}$")
+_ISO_JST_MINUTE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+def is_valid_weather_time(val: Any) -> bool:
+    """True if val is a JST datetime 'YYYY-MM-DDTHH:MM' with a real calendar date."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return False
+    s = str(val).strip()
+    if not _ISO_JST_MINUTE_RE.match(s):
+        return False
+    try:
+        pd.Timestamp(s[:10])
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def invalid_weather_time_mask(df: pd.DataFrame) -> pd.Series:
+    """Rows whose time is present but not a valid 'YYYY-MM-DDTHH:MM' (missing times are not counted)."""
+    if df.empty or "time" not in df.columns:
+        return pd.Series(False, index=df.index)
+    present = df["time"].notna() & (df["time"].astype(str).str.strip() != "")
+    valid = df["time"].map(is_valid_weather_time)
+    return present & ~valid
+
+
+def normalize_weather_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of weather DataFrame with 'HH:MM'/'H:MM' times normalized to JST ISO datetimes ('YYYY-MM-DDTHH:MM')."""
+    out = df.copy()
+    if out.empty or "time" not in out.columns or "open_day" not in out.columns:
+        return out
+
+    def _conv(row: pd.Series) -> Any:
+        t = row["time"]
+        d = row["open_day"]
+        if pd.isna(t) or pd.isna(d):
+            return t
+        t_str = str(t).strip()
+        if _HHMM_RE.match(t_str):
+            return normalize_jma_time(str(d).strip(), t_str)
+        return t
+
+    out["time"] = out.apply(_conv, axis=1)
+    return out
 
 
 class StorageError(RuntimeError):
@@ -201,6 +250,18 @@ class ParquetStorage:
             if info.get("status") == "unavailable"
         ]
 
+    @staticmethod
+    def _drop_invalid_weather_rows(df_new: pd.DataFrame, target_path: pathlib.Path) -> pd.DataFrame:
+        """Normalize new weather rows and drop rows whose time is missing or invalid (logged with a count)."""
+        df_new = normalize_weather_frame(df_new)
+        if df_new.empty or "time" not in df_new.columns:
+            return df_new
+        keep = df_new["time"].map(is_valid_weather_time)
+        dropped = int((~keep).sum())
+        if dropped:
+            logger.warning(f"Dropping {dropped} new weather rows with missing or invalid times for {target_path}")
+        return df_new[keep]
+
     def save(self, kind: str, open_day: str, records: Union[List[Dict[str, Any]], pd.DataFrame]) -> None:
         if isinstance(records, pd.DataFrame):
             df_new = records.copy()
@@ -227,8 +288,18 @@ class ParquetStorage:
                 self.unreadable_months.add(ym)
                 logger.error(f"Failed to read existing Parquet {target_path}; keeping file and stopping write: {e}")
                 raise StorageError(f"Cannot read existing Parquet {target_path}: {e}") from e
+            if kind == "weather":
+                df_existing = normalize_weather_frame(df_existing)
+                bad_existing = int(invalid_weather_time_mask(df_existing).sum())
+                if bad_existing:
+                    # 既存ファイルに不正な時刻がある月は置き換えない（件数を出して止める）
+                    logger.error(f"Refusing to rewrite {target_path}: {bad_existing} weather rows have invalid times")
+                    raise StorageError(f"{target_path} has {bad_existing} weather rows with invalid times")
+                df_new = self._drop_invalid_weather_rows(df_new, target_path)
             df_combined = pd.concat([df_existing, df_new], ignore_index=True)
         else:
+            if kind == "weather":
+                df_new = self._drop_invalid_weather_rows(df_new, target_path)
             df_combined = df_new
 
         keys = KEYS_MAP.get(kind)
