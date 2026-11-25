@@ -425,8 +425,11 @@ def parse_results_day(html: str, vel: str, date: str) -> Tuple[list[dict], list[
     sections = soup.find_all("section", id=re.compile(r"^race\d+"))
     if not sections:
         # 代替：第Nレース の見出しをテキストサーチ
-        p_tags = soup.find_all(text=re.compile(r"第\s*\d+\s*レース"))
+        p_tags = soup.find_all(string=re.compile(r"第\s*\d+\s*レース"))
         if not p_tags:
+            page_text = _clean_str(soup.get_text()) or ""
+            if any(kw in page_text for kw in ("開催中止", "順延", "開催なし")):
+                return [], [], []
             raise ValueError("No race headers found in results page (format changed).")
         # セクションが見つからなくても、親ブロック単位でまとめる
         sections = [p.find_parent(["section", "div"]) for p in p_tags if p.find_parent(["section", "div"])]

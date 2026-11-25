@@ -3,7 +3,8 @@ description: Python・依存パッケージ・rcloneの準備（共通）
 inputs:
   rclone_config:
     description: rclone.conf の中身
-    required: true
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -14,6 +15,7 @@ runs:
     - shell: bash
       run: pip install -q -r requirements.txt
     - shell: bash
+      if: ${{ inputs.rclone_config != '' }}
       env:
         RCLONE_CONFIG_CONTENT: ${{ inputs.rclone_config }}
       run: |

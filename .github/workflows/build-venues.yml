@@ -16,8 +16,6 @@ jobs:
 
       - name: Setup environment
         uses: ./.github/actions/setup
-        with:
-          rclone_config: ${{ secrets.RCLONE_CONFIG }}
 
       - name: Run build_venues script
         env:

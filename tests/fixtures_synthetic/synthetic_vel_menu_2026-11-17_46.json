@@ -1,0 +1,18 @@
+{
+  "header": {
+    "vel_name": "富山",
+    "open_day": "2026-11-17",
+    "open_grade_code": "F1",
+    "race_name": "合成テスト杯",
+    "spent_days_string": "初日",
+    "night_race_type": "0",
+    "sub_name": "テスト開催",
+    "is_girls": false,
+    "rehold_string": null
+  },
+  "races": [
+    {"race_num": 1, "is_teppan": false, "sale_to_at": "10:30", "event_name": "予選"},
+    {"race_num": 2, "is_teppan": false, "sale_to_at": "11:00", "event_name": "予選"},
+    {"race_num": 3, "is_teppan": true, "sale_to_at": "11:30", "event_name": "特選"}
+  ]
+}

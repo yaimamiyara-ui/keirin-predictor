@@ -1,0 +1,20 @@
+{
+  "odds": [
+    {
+      "bet_type": "wide",
+      "deme": "1-2",
+      "rate": "2.5〜3.1",
+      "normalize_rate": "2.5",
+      "is_valid": true,
+      "on_final": true
+    },
+    {
+      "bet_type": "nirentan",
+      "deme": "1-2",
+      "rate": "12.0",
+      "normalize_rate": "12.0",
+      "is_valid": true,
+      "on_final": true
+    }
+  ]
+}

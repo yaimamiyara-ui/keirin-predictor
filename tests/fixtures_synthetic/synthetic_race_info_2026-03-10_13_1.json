@@ -1,0 +1,128 @@
+{
+  "box": {
+    "open_day": "2026-03-10",
+    "vel_code": "13",
+    "race_num": 1,
+    "race_name": "合成テスト杯",
+    "sub_name": "テスト記念",
+    "open_grade_code": "F2",
+    "spent_days_string": "初日",
+    "night_race_type": "0",
+    "is_girls": false,
+    "sale_to_at": "10:30",
+    "race_start_at": "10:35"
+  },
+  "race_status": {
+    "entry_row": 7,
+    "bet_niwakufuku_sale_status": "on",
+    "bet_niwakutan_sale_status": "on",
+    "bet_nirenfuku_sale_status": "on",
+    "bet_nirentan_sale_status": "on",
+    "bet_wide_sale_status": "on",
+    "bet_sanrenfuku_sale_status": "on",
+    "bet_sanrentan_sale_status": "on",
+    "bet_niwakufuku_result_status": "done",
+    "bet_niwakutan_result_status": "done",
+    "bet_nirenfuku_result_status": "done",
+    "bet_nirentan_result_status": "done",
+    "bet_wide_result_status": "done",
+    "bet_sanrenfuku_result_status": "done",
+    "bet_sanrentan_result_status": "done"
+  },
+  "race_program": {
+    "distance": 1625,
+    "name": "Ａ級",
+    "event_name": "一般"
+  },
+  "race_athletes": {
+    "1": {
+      "entry_num": 1, "waku_num": 1, "un_id": 9001, "name": "テスト選手A", "age": 25,
+      "class_name": "Ａ", "group_name": "１", "pref_name": "東京", "graduate_period": 115,
+      "gear_ratio": 3.92, "gear_ratio_before": 3.92, "average_point": 82100,
+      "average_win": 100, "average_rentai": 200,
+      "nige_count": 1, "sashi_count": 2, "makuri_count": 1, "mark_count": 0,
+      "standing_count": 1, "back_count": 3, "leg_quality": "逃",
+      "first_count": 2, "second_count": 2, "third_count": 1, "out_rank_count": 15,
+      "win_count": 0, "renshou_count": 0, "prize": 1000, "rank": 10, "last3d": 1,
+      "comment": "テストコメントA",
+      "history_data1": {"place": "テスト場", "rank": "1-2-3"}
+    },
+    "2": {
+      "entry_num": 2, "waku_num": 2, "un_id": 9002, "name": "テスト選手B", "age": 28,
+      "class_name": "A", "group_name": "1", "pref_name": "神奈川", "graduate_period": 111,
+      "gear_ratio": 3.92, "gear_ratio_before": 3.92, "average_point": 83000,
+      "average_win": 120, "average_rentai": 250,
+      "nige_count": 0, "sashi_count": 3, "makuri_count": 0, "mark_count": 1,
+      "standing_count": 2, "back_count": 0, "leg_quality": "追",
+      "first_count": 3, "second_count": 1, "third_count": 2, "out_rank_count": 14,
+      "win_count": 0, "renshou_count": 0, "prize": 1100, "rank": 9, "last3d": 2,
+      "comment": "テストコメントB",
+      "history_data1": {"place": "テスト場", "rank": "2-3-4"}
+    },
+    "3": {
+      "entry_num": 3, "waku_num": 3, "un_id": 9003, "name": "テスト選手C", "age": 30,
+      "class_name": "A", "group_name": "2", "pref_name": "千葉", "graduate_period": 107,
+      "gear_ratio": 3.85, "gear_ratio_before": 3.85, "average_point": 80500,
+      "average_win": 80, "average_rentai": 180,
+      "nige_count": 0, "sashi_count": 1, "makuri_count": 1, "mark_count": 1,
+      "standing_count": 1, "back_count": 1, "leg_quality": "両",
+      "first_count": 1, "second_count": 2, "third_count": 2, "out_rank_count": 15,
+      "win_count": 0, "renshou_count": 0, "prize": 900, "rank": 11, "last3d": 3,
+      "comment": "テストコメントC",
+      "history_data1": {"place": "テスト場", "rank": "4-5-6"}
+    },
+    "4": {
+      "entry_num": 4, "waku_num": 4, "un_id": 9004, "name": "テスト選手D", "age": 33,
+      "class_name": "A", "group_name": "2", "pref_name": "埼玉", "graduate_period": 103,
+      "gear_ratio": 3.92, "gear_ratio_before": 3.92, "average_point": 79800,
+      "average_win": 50, "average_rentai": 150,
+      "nige_count": 0, "sashi_count": 1, "makuri_count": 0, "mark_count": 2,
+      "standing_count": 0, "back_count": 0, "leg_quality": "追",
+      "first_count": 1, "second_count": 2, "third_count": 1, "out_rank_count": 16,
+      "win_count": 0, "renshou_count": 0, "prize": 850, "rank": 12, "last3d": 4,
+      "comment": "テストコメントD",
+      "history_data1": {"place": "テスト場", "rank": "5-4-3"}
+    },
+    "5": {
+      "entry_num": 5, "waku_num": 5, "un_id": 9005, "name": "テスト選手E", "age": 27,
+      "class_name": "A", "group_name": "1", "pref_name": "茨城", "graduate_period": 113,
+      "gear_ratio": 3.93, "gear_ratio_before": 3.93, "average_point": 84200,
+      "average_win": 150, "average_rentai": 300,
+      "nige_count": 2, "sashi_count": 1, "makuri_count": 2, "mark_count": 0,
+      "standing_count": 2, "back_count": 5, "leg_quality": "逃",
+      "first_count": 3, "second_count": 3, "third_count": 2, "out_rank_count": 12,
+      "win_count": 0, "renshou_count": 0, "prize": 1200, "rank": 8, "last3d": 2,
+      "comment": "テストコメントE",
+      "history_data1": {"place": "テスト場", "rank": "1-1-7"}
+    },
+    "6": {
+      "entry_num": 6, "waku_num": 6, "un_id": 9006, "name": "テスト選手F", "age": 35,
+      "class_name": "A", "group_name": "2", "pref_name": "群馬", "graduate_period": 99,
+      "gear_ratio": 3.86, "gear_ratio_before": 3.86, "average_point": 78500,
+      "average_win": 40, "average_rentai": 120,
+      "nige_count": 0, "sashi_count": 1, "makuri_count": 0, "mark_count": 1,
+      "standing_count": 0, "back_count": 0, "leg_quality": "追",
+      "first_count": 0, "second_count": 2, "third_count": 3, "out_rank_count": 15,
+      "win_count": 0, "renshou_count": 0, "prize": 800, "rank": 15, "last3d": 5,
+      "comment": "テストコメントF",
+      "history_data1": {"place": "テスト場", "rank": "6-5-4"}
+    },
+    "7": {
+      "entry_num": 7, "waku_num": 6, "un_id": 9007, "name": "テスト選手G", "age": 24,
+      "class_name": "A", "group_name": "1", "pref_name": "栃木", "graduate_period": 119,
+      "gear_ratio": 3.92, "gear_ratio_before": 3.92, "average_point": 85500,
+      "average_win": 300, "average_rentai": 450,
+      "nige_count": 3, "sashi_count": 1, "makuri_count": 4, "mark_count": 0,
+      "standing_count": 3, "back_count": 6, "leg_quality": "逃",
+      "first_count": 6, "second_count": 3, "third_count": 2, "out_rank_count": 9,
+      "win_count": 1, "renshou_count": 0, "prize": 1500, "rank": 5, "last3d": 1,
+      "comment": "テストコメントG",
+      "history_data1": {"place": "テスト場", "rank": "1-2-1"}
+    }
+  },
+  "prediction": {
+    "marks": ["△", "×", "", "", "○", "", "◎"],
+    "sequences": ["7-5-1", "7-1-2"],
+    "comment": "合成テスト予想コメント"
+  }
+}
