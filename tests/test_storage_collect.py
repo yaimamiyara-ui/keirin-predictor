@@ -1036,3 +1036,43 @@ def test_whole_day_gap_respects_retry_limit_and_closes_day(tmp_path: pathlib.Pat
     assert "13|2026-03-10|chariloto|known_gaps=" in done_text
     gaps = ParquetStorage(data_dir=data_dir).get_month_gaps("2026-03")
     assert gaps and all(g["status"] == "unavailable" for g in gaps)
+
+
+def test_invalid_weather_times_are_never_written(tmp_path: pathlib.Path):
+    from keirin.scripts.migrate_weather_times import migrate_weather_dir
+    from keirin.storage import is_valid_weather_time
+
+    assert is_valid_weather_time("2026-03-10T23:59")
+    for bad in ("9:0", "2026-03-10T12:99", "2026-03-10T24:00", "2026-02-30T10:00", "24:10", "", None):
+        assert not is_valid_weather_time(bad)
+
+    # migration: one bad value mixed with good old-format rows -> file left unchanged
+    w_dir = tmp_path / "data" / "weather" / "2026"
+    w_dir.mkdir(parents=True)
+    f = w_dir / "2026-03.parquet"
+    pd.DataFrame([
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:10", "source": "jma", "temp": 5.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "9:0", "source": "jma", "temp": 6.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T12:99", "source": "openmeteo", "temp": 7.0},
+    ]).to_parquet(f, index=False)
+    before = f.read_bytes()
+    res = migrate_weather_dir(tmp_path / "data")
+    assert res[0]["skipped"] == "invalid_times" and res[0]["invalid_times"] == 2
+    assert f.read_bytes() == before
+
+    # normal save: an existing file with an invalid time is not rewritten
+    st = ParquetStorage(data_dir=tmp_path / "data")
+    new_rows = [{"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T01:00", "source": "openmeteo", "temp": 3.0}]
+    with pytest.raises(StorageError):
+        st.save("weather", "2026-03-10", new_rows)
+    assert f.read_bytes() == before
+
+    # normal save: invalid new rows are dropped, valid ones are kept
+    st2 = ParquetStorage(data_dir=tmp_path / "data2")
+    st2.save("weather", "2026-03-10", [
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "24:10", "source": "jma", "temp": 1.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "2026-03-10T12:99", "source": "openmeteo", "temp": 2.0},
+        {"vel_code": "13", "open_day": "2026-03-10", "time": "00:20", "source": "jma", "temp": 3.0},
+    ])
+    saved = pd.read_parquet(tmp_path / "data2" / "weather" / "2026" / "2026-03.parquet")
+    assert list(saved["time"]) == ["2026-03-10T00:20"]

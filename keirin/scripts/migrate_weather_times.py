@@ -3,7 +3,7 @@ import pathlib
 from typing import Any, Dict, List, Union
 import pandas as pd
 
-from keirin.storage import KEYS_MAP, _HHMM_RE, normalize_weather_frame
+from keirin.storage import KEYS_MAP, _HHMM_RE, invalid_weather_time_mask, normalize_weather_frame
 
 
 def _is_hhmm_time(val: Any) -> bool:
@@ -30,8 +30,8 @@ def migrate_weather_file(path: pathlib.Path, dry_run: bool = False) -> Dict[str,
 
     df_norm = normalize_weather_frame(df)
 
-    # 変換後も "HH:MM" のまま残った行は範囲外の時刻。ファイルを置き換えずに報告する
-    invalid = int(df_norm.apply(lambda r: _is_hhmm_time(r["time"]), axis=1).sum()) if not df_norm.empty else 0
+    # 変換後に 'YYYY-MM-DDTHH:MM' として正しくない時刻が1件でもあれば、ファイルを置き換えずに報告する
+    invalid = int(invalid_weather_time_mask(df_norm).sum())
     if invalid:
         print(f"{path}: refused (invalid_times={invalid}); file left unchanged")
         return {"path": str(path), "skipped": "invalid_times", "invalid_times": invalid, "rows_before": rows_before}
