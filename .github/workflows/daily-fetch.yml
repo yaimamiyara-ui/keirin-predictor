@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 150
     env: { PYTHONPATH: "${{ github.workspace }}" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
         with: { rclone_config: "${{ secrets.RCLONE_CONFIG }}" }
       - name: 対象日（JST）
