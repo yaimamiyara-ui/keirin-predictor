@@ -1,0 +1,37 @@
+name: keeper
+# 毎日の取得（daily-fetch）を決まった時刻に起動する見張り役（Claude作成）。
+# GitHubの定期実行は混雑で何時間も遅れたり抜けたりするため（2026-11-25〜26に8時間以上の遅れ）、
+# 1回の実行の中で10分おきに時刻を見て、JST 10:30・12:40・15:50 の各枠で daily-fetch を起動する。
+# 終わる前に自分自身を次の実行として起動して24時間つなぐ。定期実行は途切れたときの保険。
+# 取得済みの分は daily-fetch が飛ばすので、同じ枠で2回起動しても重複しない。
+on:
+  schedule:
+    - cron: "7 1,7,13,19 * * *"
+  workflow_dispatch:
+permissions: { contents: read, actions: write }
+concurrency: { group: keirin-keeper, cancel-in-progress: false }
+jobs:
+  keep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 10分おきに時刻を見て毎日の取得を起動（約5時間半）
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          START=$(date +%s); DONE=" "
+          while [ $(( $(date +%s) - START )) -lt 19800 ]; do
+            # 0時からの分数で比べる（各枠の30分間に2〜3回確かめる）
+            NOW=$(( 10#$(TZ=Asia/Tokyo date +%H) * 60 + 10#$(TZ=Asia/Tokyo date +%M) )); DAY=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+            for SLOT in 1030 1240 1550; do
+              S0=$(( 10#${SLOT:0:2} * 60 + 10#${SLOT:2:2} ))
+              if [ "$NOW" -ge "$S0" ] && [ "$NOW" -lt $(( S0 + 30 )) ]; then
+                KEY="$DAY-$SLOT"
+                case "$DONE" in *" $KEY "*) ;; *)
+                  gh api -X POST "repos/${{ github.repository }}/actions/workflows/daily-fetch.yml/dispatches" -f ref=main \
+                    && { DONE="$DONE$KEY "; echo "$KEY daily-fetch を起動"; } || echo "$KEY 起動に失敗（次の回で再試行）"
+                ;; esac
+              fi
+            done
+            sleep $(( 600 - $(date +%s) % 600 + 20 ))
+          done
+          gh api -X POST "repos/${{ github.repository }}/actions/workflows/keeper.yml/dispatches" -f ref=main && echo "次の実行を起動"
